@@ -29,6 +29,9 @@ from langchain_ollama import ChatOllama
 from langchain_core.output_parsers.base import OutputParserLike
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
+import logging
+import json
+from datetime import datetime
 
 from typing import (
     TYPE_CHECKING,
@@ -38,6 +41,13 @@ from typing import (
     Optional,
     Union,
     cast,
+)
+
+# Set up logging at the top of the file
+logging.basicConfig(
+    filename='custom_llm_debug.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
 class DeepSeekR1ChatOpenAI(ChatOpenAI):
@@ -140,9 +150,11 @@ class CustomAzureOpenAI(AzureChatOpenAI):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Create a custom client with the required headers
+        complete_url = f"{kwargs.get('azure_endpoint', '')}/deployments/gpt-35-turbo/chat/completions?api-version=2024-10-21"
+        logging.debug(f"Initializing CustomAzureOpenAI with URL: {complete_url}")  # Log the URL
+        
         self.client = OpenAI(
-            base_url=kwargs.get('azure_endpoint', ''),
+            base_url=complete_url,
             api_key=kwargs.get("api_key", ""),
             default_headers={
                 'Accept': 'application/json',
@@ -187,9 +199,8 @@ class CustomAzureOpenAI(AzureChatOpenAI):
             messages = self._convert_input_to_messages(input)
             message_dicts = [self._convert_message_to_dict(m) for m in messages]
             
-            print(f"Sending request to: {self.client.base_url}")
-            print(f"Headers: {self.client.default_headers}")
-            print(f"Messages: {message_dicts}")
+            logging.debug(f"Making request to URL: {self.client.base_url}")  # Log URL
+            logging.debug(f"With headers: {self.client.default_headers}")    # Log headers
             
             completion = self.client.chat.completions.create(
                 model=self.model_name,
@@ -201,7 +212,7 @@ class CustomAzureOpenAI(AzureChatOpenAI):
             response_content = self._sanitize_text(completion.choices[0].message.content)
             return AIMessage(content=response_content)
         except Exception as e:
-            print(f"Error in invoke: {str(e)}")
+            logging.error(f"Error in invoke: {str(e)}", exc_info=True)  # Log errors with traceback
             raise
         
     async def ainvoke(
