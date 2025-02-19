@@ -12,7 +12,7 @@ from langchain_ollama import ChatOllama
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 import gradio as gr
 
-from .llm import DeepSeekR1ChatOpenAI, DeepSeekR1ChatOllama
+from .llm import DeepSeekR1ChatOpenAI, DeepSeekR1ChatOllama, CustomAzureOpenAI
 
 PROVIDER_DISPLAY_NAMES = {
     "openai": "OpenAI",
@@ -21,7 +21,8 @@ PROVIDER_DISPLAY_NAMES = {
     "deepseek": "DeepSeek",
     "google": "Google",
     "alibaba": "Alibaba",
-    "moonshot": "MoonShot"
+    "moonshot": "MoonShot",
+    "custom": "Custom LLM"
 }
 
 def get_llm_model(provider: str, **kwargs):
@@ -158,6 +159,15 @@ def get_llm_model(provider: str, **kwargs):
             base_url=os.getenv("MOONSHOT_ENDPOINT"),
             api_key=os.getenv("MOONSHOT_API_KEY"),
         )
+    elif provider == "custom":
+        return CustomAzureOpenAI(
+            deployment_name="gpt-35-turbo",
+            model_name=kwargs.get("model_name", "gpt-35-turbo"),
+            temperature=kwargs.get("temperature", 0.7),
+            api_version=kwargs.get("api_version", "2024-10-21"),
+            azure_endpoint=kwargs.get("base_url", ""),
+            api_key=api_key,
+        )
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
@@ -165,6 +175,7 @@ def get_llm_model(provider: str, **kwargs):
 model_names = {
     "anthropic": ["claude-3-5-sonnet-20240620", "claude-3-opus-20240229"],
     "openai": ["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o3-mini"],
+    "custom": ["gpt-35-turbo"],
     "deepseek": ["deepseek-chat", "deepseek-reasoner"],
     "google": ["gemini-2.0-flash", "gemini-2.0-flash-thinking-exp", "gemini-1.5-flash-latest", "gemini-1.5-flash-8b-latest", "gemini-2.0-flash-thinking-exp-01-21", "gemini-2.0-pro-exp-02-05"],
     "ollama": ["qwen2.5:7b", "qwen2.5:14b", "qwen2.5:32b", "qwen2.5-coder:14b", "qwen2.5-coder:32b", "llama2:7b", "deepseek-r1:14b", "deepseek-r1:32b"],
