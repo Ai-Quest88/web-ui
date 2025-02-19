@@ -32,6 +32,8 @@ from langchain_core.tools import BaseTool
 import logging
 import json
 from datetime import datetime
+import os
+import tempfile
 
 from typing import (
     TYPE_CHECKING,
@@ -43,12 +45,22 @@ from typing import (
     cast,
 )
 
+# Create tmp directory in current project directory
+log_dir = os.path.join(os.getcwd(), 'tmp', 'logs')
+os.makedirs(log_dir, exist_ok=True)
+
+log_file = os.path.join(log_dir, 'custom_llm_debug.log')
+
 # Set up logging at the top of the file
 logging.basicConfig(
-    filename='custom_llm_debug.log',
+    filename=log_file,
     level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    force=True  # Force configuration to ensure it takes effect
 )
+
+# Print the log file location to console
+print(f"Log file location: {log_file}")
 
 class DeepSeekR1ChatOpenAI(ChatOpenAI):
     
