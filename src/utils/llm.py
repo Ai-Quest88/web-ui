@@ -248,16 +248,18 @@ class CustomAzureOpenAI(AzureChatOpenAI):
                 'x-correlation-id': str(uuid.uuid4())
             }
             
-            # Get headers without Omit objects
-            all_headers = dict(self.client.default_headers)
-            headers_to_log = {k: v for k, v in all_headers.items() 
-                            if not (hasattr(v, '__class__') and v.__class__.__name__ == 'Omit')}
-            headers_to_log.update(extra_headers)
+            # Get clean URL without trailing slash
+            api_url = str(self.client.base_url).rstrip('/')
             
             # Log request details
             request_details = {
-                'url': str(self.client.base_url),
-                'headers': headers_to_log,
+                'url': api_url,  # Use cleaned URL
+                'headers': {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'x-subscription-key': '****',  # Mask the key
+                    'x-correlation-id': extra_headers['x-correlation-id']
+                },
                 'request': {
                     'model': self.model_name,
                     'messages': message_dicts,
