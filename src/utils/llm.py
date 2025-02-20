@@ -186,6 +186,9 @@ class CustomAzureOpenAI(AzureChatOpenAI):
         base_url = ""
         api_version = kwargs.get("api_version", "2024-10-21")
         
+        # Append api version to base URL
+        base_url = f"{base_url}?api-version={api_version}"
+        
         logging.debug(f"Initializing CustomAzureOpenAI with base URL: {base_url}")
         
         # Create headers dict first
