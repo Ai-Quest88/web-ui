@@ -186,10 +186,11 @@ class CustomAzureOpenAI(AzureChatOpenAI):
         base_url = ""
         api_version = kwargs.get("api_version", "2024-10-21")
         
-        # Append api version to base URL
-        base_url = f"{base_url}?api-version={api_version}"
+        # Ensure clean URL by removing any trailing slashes before adding query params
+        self._base_url = self._base_url.rstrip('/')
+        self._base_url = f"{self._base_url}?api-version={api_version}"
         
-        logging.debug(f"Initializing CustomAzureOpenAI with base URL: {base_url}")
+        logging.debug(f"Initializing CustomAzureOpenAI with base URL: {self._base_url}")
         
         # Create headers dict first
         headers = {
@@ -201,15 +202,19 @@ class CustomAzureOpenAI(AzureChatOpenAI):
         
         logging.debug(f"Using headers: {headers}")
         
-        # Create client with minimal configuration like in the image
+        # Create client with minimal configuration
         self.client = OpenAI(
-            base_url=base_url,
+            base_url=self._base_url,
             api_key=kwargs.get("api_key", ""),
             default_headers=headers
         )
         self.model_name = "gpt-35-turbo"
         self.temperature = kwargs.get("temperature", 0.7)
         
+    def _get_clean_url(self) -> str:
+        """Get base URL without trailing slash"""
+        return self._base_url.rstrip('/')
+
     def _sanitize_text(self, text: Any) -> str:
         """Sanitize text to ensure it's properly encoded"""
         if text is None:
@@ -243,41 +248,42 @@ class CustomAzureOpenAI(AzureChatOpenAI):
             messages = self._convert_input_to_messages(input)
             message_dicts = [self._convert_message_to_dict(m) for m in messages]
             
-            # Add extra headers for each request
+            # Add correlation ID for this request
             extra_headers = {
                 'x-correlation-id': str(uuid.uuid4())
             }
             
-            # Get clean URL without trailing slash
-            api_url = str(self.client.base_url).rstrip('/')
+            # Get actual headers being sent, handling Omit objects
+            actual_headers = {}
+            for k, v in self.client.default_headers.items():
+                if hasattr(v, '__class__') and v.__class__.__name__ == 'Omit':
+                    continue  # Skip Omit objects
+                actual_headers[k] = v
+            actual_headers.update(extra_headers)
             
-            # Log request details
+            # Create completion parameters
+            completion_params = {
+                'model': self.model_name,
+                'messages': message_dicts,
+                'temperature': self.temperature,
+                'max_tokens': 100,
+                'n': 1,
+                'extra_headers': extra_headers
+            }
+            
+            # Log request details with all information
             request_details = {
-                'url': api_url,  # Use cleaned URL
-                'headers': {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'x-subscription-key': '****',  # Mask the key
-                    'x-correlation-id': extra_headers['x-correlation-id']
+                'request_url': self._get_clean_url(),  # Use our clean URL getter
+                'request_headers': {
+                    k: '****' if k.lower() in ['x-subscription-key', 'authorization'] else v 
+                    for k, v in actual_headers.items()
                 },
-                'request': {
-                    'model': self.model_name,
-                    'messages': message_dicts,
-                    'temperature': self.temperature,
-                    'max_tokens': 100,
-                    'n': 1
-                }
+                'completion_params': completion_params
             }
             logging.debug(f"Request Details:\n{json.dumps(request_details, indent=2)}")
             
-            completion = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=message_dicts,
-                temperature=self.temperature,
-                max_tokens=100,
-                n=1,
-                extra_headers=extra_headers
-            )
+            # Make the API call with same parameters we logged
+            completion = self.client.chat.completions.create(**completion_params)
             
             # Log response details
             response_details = {
