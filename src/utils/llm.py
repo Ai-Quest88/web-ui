@@ -34,6 +34,8 @@ import json
 from datetime import datetime
 import os
 import tempfile
+import uuid
+from httpx import Client
 
 from typing import (
     TYPE_CHECKING,
@@ -79,23 +81,28 @@ class DeepSeekR1ChatOpenAI(ChatOpenAI):
         stop: Optional[list[str]] = None,
         **kwargs: Any,
     ) -> AIMessage:
-        message_history = []
-        for input_ in input:
-            if isinstance(input_, SystemMessage):
-                message_history.append({"role": "system", "content": input_.content})
-            elif isinstance(input_, AIMessage):
-                message_history.append({"role": "assistant", "content": input_.content})
-            else:
-                message_history.append({"role": "user", "content": input_.content})
-        
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=message_history
-        )
-
-        reasoning_content = response.choices[0].message.reasoning_content
-        content = response.choices[0].message.content
-        return AIMessage(content=content, reasoning_content=reasoning_content)
+        """Process async invocation"""
+        try:
+            messages = self._convert_input_to_messages(input)
+            message_dicts = []
+            
+            for msg in messages:
+                if isinstance(msg, SystemMessage):
+                    message_dicts.append({"role": "system", "content": str(msg.content)})
+                elif isinstance(msg, AIMessage):
+                    message_dicts.append({"role": "assistant", "content": str(msg.content)})
+                else:
+                    message_dicts.append({"role": "user", "content": str(msg.content)})
+            
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=message_dicts
+            )
+            
+            return AIMessage(content=str(response.choices[0].message.content))
+        except Exception as e:
+            logging.error(f"Error in ainvoke: {str(e)}", exc_info=True)
+            raise
     
     def invoke(
         self,
@@ -105,24 +112,38 @@ class DeepSeekR1ChatOpenAI(ChatOpenAI):
         stop: Optional[list[str]] = None,
         **kwargs: Any,
     ) -> AIMessage:
-        message_history = []
-        for input_ in input:
-            if isinstance(input_, SystemMessage):
-                message_history.append({"role": "system", "content": input_.content})
-            elif isinstance(input_, AIMessage):
-                message_history.append({"role": "assistant", "content": input_.content})
-            else:
-                message_history.append({"role": "user", "content": input_.content})
-        
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=message_history
-        )
+        """Process synchronous invocation"""
+        try:
+            messages = self._convert_input_to_messages(input)
+            message_dicts = []
+            
+            for msg in messages:
+                if isinstance(msg, SystemMessage):
+                    message_dicts.append({"role": "system", "content": str(msg.content)})
+                elif isinstance(msg, AIMessage):
+                    message_dicts.append({"role": "assistant", "content": str(msg.content)})
+                else:
+                    message_dicts.append({"role": "user", "content": str(msg.content)})
+            
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=message_dicts
+            )
+            
+            return AIMessage(content=str(response.choices[0].message.content))
+        except Exception as e:
+            logging.error(f"Error in invoke: {str(e)}", exc_info=True)
+            raise
 
-        reasoning_content = response.choices[0].message.reasoning_content
-        content = response.choices[0].message.content
-        return AIMessage(content=content, reasoning_content=reasoning_content)
-    
+    def _convert_input_to_messages(self, input: LanguageModelInput) -> list[BaseMessage]:
+        """Convert input to messages"""
+        if isinstance(input, list):
+            return [m if isinstance(m, BaseMessage) else HumanMessage(content=str(m)) for m in input]
+        elif isinstance(input, BaseMessage):
+            return [input]
+        else:
+            return [HumanMessage(content=str(input))]
+
 class DeepSeekR1ChatOllama(ChatOllama):
         
     async def ainvoke(
@@ -162,18 +183,26 @@ class CustomAzureOpenAI(AzureChatOpenAI):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        complete_url = f"{kwargs.get('azure_endpoint', '')}/deployments/gpt-35-turbo/chat/completions?api-version=2024-10-21"
-        logging.debug(f"Initializing CustomAzureOpenAI with URL: {complete_url}")  # Log the URL
+        base_url = ""
+        api_version = kwargs.get("api_version", "2024-10-21")
         
+        logging.debug(f"Initializing CustomAzureOpenAI with base URL: {base_url}")
+        
+        # Create headers dict first
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'x-subscription-key': kwargs.get("api_key", ""),
+            'x-correlation-id': str(uuid.uuid4())
+        }
+        
+        logging.debug(f"Using headers: {headers}")
+        
+        # Create client with minimal configuration like in the image
         self.client = OpenAI(
-            base_url=complete_url,
+            base_url=base_url,
             api_key=kwargs.get("api_key", ""),
-            default_headers={
-                'Accept': 'application/json',
-                'x-subscription-key': kwargs.get("api_key", ""),
-                'x-correlation-id': kwargs.get("x_correlation_id", ""),
-                'Content-Type': 'application/json',
-            }
+            default_headers=headers
         )
         self.model_name = "gpt-35-turbo"
         self.temperature = kwargs.get("temperature", 0.7)
@@ -211,55 +240,78 @@ class CustomAzureOpenAI(AzureChatOpenAI):
             messages = self._convert_input_to_messages(input)
             message_dicts = [self._convert_message_to_dict(m) for m in messages]
             
-            logging.debug(f"Making request to URL: {self.client.base_url}")  # Log URL
-            logging.debug(f"With headers: {self.client.default_headers}")    # Log headers
+            # Add extra headers for each request
+            extra_headers = {
+                'x-correlation-id': str(uuid.uuid4())
+            }
+            
+            # Get headers without Omit objects
+            all_headers = dict(self.client.default_headers)
+            headers_to_log = {k: v for k, v in all_headers.items() 
+                            if not (hasattr(v, '__class__') and v.__class__.__name__ == 'Omit')}
+            headers_to_log.update(extra_headers)
+            
+            # Log request details
+            request_details = {
+                'url': str(self.client.base_url),
+                'headers': headers_to_log,
+                'request': {
+                    'model': self.model_name,
+                    'messages': message_dicts,
+                    'temperature': self.temperature,
+                    'max_tokens': 100,
+                    'n': 1
+                }
+            }
+            logging.debug(f"Request Details:\n{json.dumps(request_details, indent=2)}")
             
             completion = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=message_dicts,
                 temperature=self.temperature,
                 max_tokens=100,
-                n=1
+                n=1,
+                extra_headers=extra_headers
             )
-            response_content = self._sanitize_text(completion.choices[0].message.content)
-            return AIMessage(content=response_content)
-        except Exception as e:
-            logging.error(f"Error in invoke: {str(e)}", exc_info=True)  # Log errors with traceback
-            raise
-        
-    async def ainvoke(
-        self,
-        input: LanguageModelInput,
-        config: Optional[RunnableConfig] = None,
-        **kwargs: Any,
-    ) -> AIMessage:
-        """Override ainvoke to use our custom client"""
-        try:
-            messages = self._convert_input_to_messages(input)
-            message_dicts = [self._convert_message_to_dict(m) for m in messages]
             
-            completion = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=message_dicts,
-                temperature=self.temperature,
-                max_tokens=100,
-                n=1
-            )
+            # Log response details
+            response_details = {
+                'status': 'success',
+                'response': {
+                    'content': completion.choices[0].message.content,
+                    'role': completion.choices[0].message.role
+                }
+            }
+            logging.debug(f"Response Details:\n{json.dumps(response_details, indent=2)}")
+            
             response_content = self._sanitize_text(completion.choices[0].message.content)
             return AIMessage(content=response_content)
         except Exception as e:
-            print(f"Error in ainvoke: {str(e)}")
+            # Log error details
+            error_details = {
+                'status': 'error',
+                'error_type': type(e).__name__,
+                'error_message': str(e)
+            }
+            logging.error(f"Error Details:\n{json.dumps(error_details, indent=2)}", exc_info=True)
             raise
 
     def _convert_input_to_messages(self, input: LanguageModelInput) -> list[BaseMessage]:
         """Helper method to convert input to messages"""
         if isinstance(input, list):
-            return input
+            return [m if isinstance(m, BaseMessage) else HumanMessage(content=str(m)) for m in input]
         elif isinstance(input, BaseMessage):
             return [input]
         else:
             return [HumanMessage(content=self._sanitize_text(input))]
 
     def _construct_endpoint(self, deployment_name: str) -> str:
-        """Override to return the exact URL with api-version"""
+        """Override to return the exact URL"""
         return self.client.base_url
+
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        # Handle Omit type
+        if hasattr(obj, '__class__') and obj.__class__.__name__ == 'Omit':
+            return str(obj)  # or return a dict representation if available
+        return super().default(obj)
