@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 import requests
+import logging
 
 from langchain_anthropic import ChatAnthropic
 from langchain_mistralai import ChatMistralAI
@@ -12,7 +13,8 @@ from langchain_ollama import ChatOllama
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 import gradio as gr
 
-from .llm import DeepSeekR1ChatOpenAI, DeepSeekR1ChatOllama, CustomAzureOpenAI
+from .llm import DeepSeekR1ChatOpenAI, DeepSeekR1ChatOllama, CustomAzureOpenAI, CustomMistralAI
+from pydantic import SecretStr
 
 PROVIDER_DISPLAY_NAMES = {
     "openai": "OpenAI",
@@ -27,17 +29,18 @@ PROVIDER_DISPLAY_NAMES = {
 
 def get_llm_model(provider: str, **kwargs):
     """
-    获取LLM 模型
-    :param provider: 模型类型
+    Get LLM model
+    :param provider: model type
     :param kwargs:
     :return:
     """
     if provider not in ["ollama"]:
         env_var = f"{provider.upper()}_API_KEY"
-        api_key = kwargs.get("api_key", "") or os.getenv(env_var, "")
-        if not api_key:
+        raw_api_key = kwargs.get("api_key", "") or os.getenv(env_var, "")
+        if not raw_api_key:
             handle_api_key_error(provider, env_var)
-        kwargs["api_key"] = api_key
+        # Convert api_key to SecretStr for all providers
+        api_key = str(raw_api_key)  # Ensure we have a string
 
     if provider == "anthropic":
         if not kwargs.get("base_url", ""):
@@ -50,22 +53,14 @@ def get_llm_model(provider: str, **kwargs):
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,
             api_key=api_key,
+            timeout=kwargs.get("timeout", 120),
+            stop=kwargs.get("stop", None)
         )
     elif provider == 'mistral':
-        if not kwargs.get("base_url", ""):
-            base_url = os.getenv("MISTRAL_ENDPOINT", "https://api.mistral.ai/v1")
-        else:
-            base_url = kwargs.get("base_url")
-        if not kwargs.get("api_key", ""):
-            api_key = os.getenv("MISTRAL_API_KEY", "")
-        else:
-            api_key = kwargs.get("api_key")
-
         return ChatMistralAI(
-            model=kwargs.get("model_name", "mistral-large-latest"),
+            model_name=kwargs.get("model_name", "mistral-large-latest"),
             temperature=kwargs.get("temperature", 0.0),
-            base_url=base_url,
-            api_key=api_key,
+            api_key=api_key
         )
     elif provider == "openai":
         if not kwargs.get("base_url", ""):
@@ -78,6 +73,7 @@ def get_llm_model(provider: str, **kwargs):
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,
             api_key=api_key,
+            timeout=kwargs.get("timeout", 120)
         )
     elif provider == "deepseek":
         if not kwargs.get("base_url", ""):
@@ -103,7 +99,7 @@ def get_llm_model(provider: str, **kwargs):
         return ChatGoogleGenerativeAI(
             model=kwargs.get("model_name", "gemini-2.0-flash-exp"),
             temperature=kwargs.get("temperature", 0.0),
-            google_api_key=api_key,
+            api_key=api_key
         )
     elif provider == "ollama":
         if not kwargs.get("base_url", ""):
@@ -137,7 +133,7 @@ def get_llm_model(provider: str, **kwargs):
             temperature=kwargs.get("temperature", 0.0),
             api_version=api_version,
             azure_endpoint=base_url,
-            api_key=api_key,
+            api_key=api_key
         )
     elif provider == "alibaba":
         if not kwargs.get("base_url", ""):
@@ -149,24 +145,29 @@ def get_llm_model(provider: str, **kwargs):
             model=kwargs.get("model_name", "qwen-plus"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=base_url,
-            api_key=api_key,
+            api_key=api_key
         )
 
     elif provider == "moonshot":
+        moonshot_api_key = SecretStr(os.getenv("MOONSHOT_API_KEY", ""))
         return ChatOpenAI(
             model=kwargs.get("model_name", "moonshot-v1-32k-vision-preview"),
             temperature=kwargs.get("temperature", 0.0),
             base_url=os.getenv("MOONSHOT_ENDPOINT"),
-            api_key=os.getenv("MOONSHOT_API_KEY"),
+            api_key=moonshot_api_key
         )
     elif provider == "custom":
+        if not kwargs.get("base_url", ""):
+            base_url = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+        else:
+            base_url = kwargs.get("base_url")
+            
         return CustomAzureOpenAI(
-            deployment_name="gpt-35-turbo",
             model_name=kwargs.get("model_name", "gpt-35-turbo"),
             temperature=kwargs.get("temperature", 0.7),
             api_version=kwargs.get("api_version", "2024-10-21"),
-            azure_endpoint=kwargs.get("base_url", ""),
-            api_key=api_key,
+            azure_endpoint=base_url,
+            api_key=SecretStr(api_key) if api_key else None
         )
     else:
         raise ValueError(f"Unsupported provider: {provider}")
@@ -240,6 +241,7 @@ def get_latest_files(directory: str, file_types: list = ['.webm', '.zip']) -> Di
             print(f"Error getting latest {file_type} file: {e}")
             
     return latest_files
+
 async def capture_screenshot(browser_context):
     """Capture and encode a screenshot"""
     # Extract the Playwright browser instance

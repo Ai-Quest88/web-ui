@@ -19,7 +19,7 @@ from browser_use.agent.views import (
 )
 from browser_use.browser.browser import Browser
 from browser_use.browser.context import BrowserContext
-from browser_use.browser.views import BrowserStateHistory
+from browser_use.browser.views import BrowserStateHistory, BrowserState
 from browser_use.controller.service import Controller
 from browser_use.telemetry.views import (
     AgentEndTelemetryEvent,
@@ -40,6 +40,9 @@ from src.utils.agent_state import AgentState
 
 from .custom_message_manager import CustomMessageManager
 from .custom_views import CustomAgentOutput, CustomAgentStepInfo
+from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+from langchain_core.outputs import LLMResult
+from langchain_core.runnables import RunnableConfig
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +56,7 @@ class CustomAgent(Agent):
             browser: Browser | None = None,
             browser_context: BrowserContext | None = None,
             controller: Controller = Controller(),
-            use_vision: bool = True,
+            use_vision: bool = False,
             use_vision_for_planner: bool = False,
             save_conversation_path: Optional[str] = None,
             save_conversation_path_encoding: Optional[str] = 'utf-8',
@@ -121,28 +124,23 @@ class CustomAgent(Agent):
             planner_llm=planner_llm,
             planner_interval=planner_interval
         )
-        if self.model_name in ["deepseek-reasoner"] or "deepseek-r1" in self.model_name:
-            # deepseek-reasoner does not support function calling
-            self.use_deepseek_r1 = True
-            # deepseek-reasoner only support 64000 context
-            self.max_input_tokens = 64000
-        else:
-            self.use_deepseek_r1 = False
-
-        # record last actions
-        self._last_actions = None
-        # record extract content
-        self.extracted_content = ""
-        # custom new info
+        self.use_vision = False  # Force vision to be disabled
+        self.use_vision_for_planner = False  # Force planner vision to be disabled
         self.add_infos = add_infos
-
         self.agent_prompt_class = agent_prompt_class
+        self._last_actions = None  # Initialize _last_actions
+        self._last_result = None   # Initialize _last_result
+        self.extracted_content = "" # Initialize extracted_content
+        self._setup_message_manager()
+
+    def _setup_message_manager(self):
+        """Setup message manager with correct vision settings"""
         self.message_manager = CustomMessageManager(
             llm=self.llm,
             task=self.task,
             action_descriptions=self.controller.registry.get_prompt_description(),
             system_prompt_class=self.system_prompt_class,
-            agent_prompt_class=agent_prompt_class,
+            agent_prompt_class=self.agent_prompt_class,
             max_input_tokens=self.max_input_tokens,
             include_attributes=self.include_attributes,
             max_error_length=self.max_error_length,
@@ -209,35 +207,56 @@ class CustomAgent(Agent):
     @time_execution_async("--get_next_action")
     async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
         """Get next action from LLM based on current state"""
+        try:
+            # Call LLM without extra parameters to avoid API compatibility issues
+            ai_message = await self.llm.ainvoke(input_messages)
+            self.message_manager._add_message_with_tokens(ai_message)
 
-        ai_message = self.llm.invoke(input_messages)
-        self.message_manager._add_message_with_tokens(ai_message)
+            # Get content from message
+            content = ai_message.content if hasattr(ai_message, 'content') else None
+            if content is None:
+                raise ValueError('LLM response has no content')
 
-        if hasattr(ai_message, "reasoning_content"):
-            logger.info("🤯 Start Deep Thinking: ")
-            logger.info(ai_message.reasoning_content)
-            logger.info("🤯 End Deep Thinking")
+            # Handle content list or string
+            if isinstance(content, list):
+                # Handle list of messages
+                text_content = ""
+                for msg in content:
+                    if isinstance(msg, dict):
+                        text_content += msg.get('text', '')
+                    else:
+                        text_content += str(msg)
+                content = text_content
+            else:
+                content = str(content)
 
-        if isinstance(ai_message.content, list):
-            ai_content = ai_message.content[0]
-        else:
-            ai_content = ai_message.content
+            # Clean up and parse content
+            content = content.replace("```json", "").replace("```", "").strip()
+            try:
+                content = repair_json(content)
+                parsed_json = json.loads(content)
+                parsed: AgentOutput = self.AgentOutput(**parsed_json)
 
-        ai_content = ai_content.replace("```json", "").replace("```", "")
-        ai_content = repair_json(ai_content)
-        parsed_json = json.loads(ai_content)
-        parsed: AgentOutput = self.AgentOutput(**parsed_json)
+                if parsed is None:
+                    logger.debug(content)
+                    raise ValueError('Could not parse response.')
 
-        if parsed is None:
-            logger.debug(ai_message.content)
-            raise ValueError('Could not parse response.')
+                # Limit actions to maximum allowed per step
+                parsed.action = parsed.action[: self.max_actions_per_step]
+                self._log_response(parsed)
+                self.n_steps += 1
 
-        # Limit actions to maximum allowed per step
-        parsed.action = parsed.action[: self.max_actions_per_step]
-        self._log_response(parsed)
-        self.n_steps += 1
+                return parsed
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON response: {content}")
+                raise ValueError(f"Invalid JSON response: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error parsing response: {str(e)}")
+                raise
 
-        return parsed
+        except Exception as e:
+            logger.error(f"Error in get_next_action: {str(e)}")
+            raise
 
     async def _run_planner(self) -> Optional[str]:
         """Run the planner to analyze state and suggest next steps"""
@@ -569,3 +588,9 @@ class CustomAgent(Agent):
             logger.info(f'Created GIF at {output_path}')
         else:
             logger.warning('No images found in history to create GIF')
+
+    def add_state_message(self, state, last_actions=None, last_result=None, step_info=None):
+        """Add state message with vision disabled"""
+        if hasattr(state, 'screenshot'):
+            state.screenshot = None  # Remove screenshot data
+        self.message_manager.add_state_message(state, last_actions, last_result, step_info, use_vision=False)

@@ -117,92 +117,52 @@ Notes:
 
 class CustomAgentMessagePrompt(AgentMessagePrompt):
     def __init__(
-            self,
-            state: BrowserState,
-            actions: Optional[List[ActionModel]] = None,
-            result: Optional[List[ActionResult]] = None,
-            include_attributes: list[str] = [],
-            max_error_length: int = 400,
-            step_info: Optional[CustomAgentStepInfo] = None,
+        self,
+        state: BrowserState,
+        step_info: Optional[CustomAgentStepInfo] = None,
+        include_attributes: list[str] = [],
+        max_error_length: int = 400,
     ):
-        super(CustomAgentMessagePrompt, self).__init__(state=state,
-                                                       result=result,
-                                                       include_attributes=include_attributes,
-                                                       max_error_length=max_error_length,
-                                                       step_info=step_info
-                                                       )
-        self.actions = actions
+        super().__init__(
+            state=state,
+            include_attributes=include_attributes,
+            max_error_length=max_error_length,
+        )
+        self.step_info = step_info
 
     def get_user_message(self, use_vision: bool = True) -> HumanMessage:
-        if self.step_info:
-            step_info_description = f'Current step: {self.step_info.step_number}/{self.step_info.max_steps}\n'
-        else:
-            step_info_description = ''
-
-        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        step_info_description += f"Current date and time: {time_str}"
-
-        elements_text = self.state.element_tree.clickable_elements_to_string(include_attributes=self.include_attributes)
-
-        has_content_above = (self.state.pixels_above or 0) > 0
-        has_content_below = (self.state.pixels_below or 0) > 0
-
-        if elements_text != '':
-            if has_content_above:
-                elements_text = (
-                    f'... {self.state.pixels_above} pixels above - scroll or extract content to see more ...\n{elements_text}'
-                )
-            else:
-                elements_text = f'[Start of page]\n{elements_text}'
-            if has_content_below:
-                elements_text = (
-                    f'{elements_text}\n... {self.state.pixels_below} pixels below - scroll or extract content to see more ...'
-                )
-            else:
-                elements_text = f'{elements_text}\n[End of page]'
-        else:
-            elements_text = 'empty page'
-
-        state_description = f"""
-{step_info_description}
-1. Task: {self.step_info.task}. 
-2. Hints(Optional): 
-{self.step_info.add_infos}
-3. Memory: 
-{self.step_info.memory}
-4. Current url: {self.state.url}
-5. Available tabs:
-{self.state.tabs}
-6. Interactive elements:
-{elements_text}
-        """
-
-        if self.actions and self.result:
-            state_description += "\n **Previous Actions** \n"
-            state_description += f'Previous step: {self.step_info.step_number-1}/{self.step_info.max_steps} \n'
-            for i, result in enumerate(self.result):
-                action = self.actions[i]
-                state_description += f"Previous action {i + 1}/{len(self.result)}: {action.model_dump_json(exclude_unset=True)}\n"
-                if result.include_in_memory:
-                    if result.extracted_content:
-                        state_description += f"Result of previous action {i + 1}/{len(self.result)}: {result.extracted_content}\n"
-                    if result.error:
-                        # only use last 300 characters of error
-                        error = result.error[-self.max_error_length:]
-                        state_description += (
-                            f"Error of previous action {i + 1}/{len(self.result)}: ...{error}\n"
-                        )
-
-        if self.state.screenshot and use_vision == True:
-            # Format message for vision model
-            return HumanMessage(
-                content=[
-                    {'type': 'text', 'text': state_description},
-                    {
-                        'type': 'image_url',
-                        'image_url': {'url': f'data:image/png;base64,{self.state.screenshot}'},
-                    },
-                ]
-            )
-
+        # Always return text-only message regardless of use_vision parameter
+        state_description = self._get_state_description()
         return HumanMessage(content=state_description)
+
+    def _get_state_description(self) -> str:
+        state_description = ""
+        
+        if self.step_info:
+            state_description += f"Task: {self.step_info.task}\n"
+            if self.step_info.add_infos:
+                state_description += f"Additional Information: {self.step_info.add_infos}\n"
+            state_description += f"Current step: {self.step_info.step_number}/{self.step_info.max_steps}\n"
+            if self.step_info.memory:
+                state_description += f"Memory: {self.step_info.memory}\n"
+            if self.step_info.task_progress:
+                state_description += f"Task Progress: {self.step_info.task_progress}\n"
+            if self.step_info.future_plans:
+                state_description += f"Future Plans: {self.step_info.future_plans}\n"
+
+        state_description += "\n **Current State** \n"
+        state_description += f"Current URL: {self.state.url}\n"
+        state_description += f"Current Title: {self.state.title}\n"
+
+        # Handle elements from BrowserState
+        if hasattr(self.state, 'element_list') and self.state.element_list:
+            state_description += "Current Elements:\n"
+            for element in self.state.element_list:
+                element_str = "- "
+                for attr in self.include_attributes:
+                    if hasattr(element, attr) and getattr(element, attr):
+                        element_str += f"{attr}: {getattr(element, attr)}, "
+                if element_str != "- ":
+                    state_description += element_str[:-2] + "\n"
+
+        return state_description

@@ -2,6 +2,7 @@ from openai import OpenAI
 import pdb
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_core.globals import get_llm_cache
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.base import (
     BaseLanguageModel,
     LangSmithParams,
@@ -29,6 +30,8 @@ from langchain_ollama import ChatOllama
 from langchain_core.output_parsers.base import OutputParserLike
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool
+from langchain_mistralai import ChatMistralAI
+from langchain.callbacks.manager import CallbackManagerForLLMRun
 import logging
 import json
 from datetime import datetime
@@ -36,16 +39,23 @@ import os
 import tempfile
 import uuid
 from httpx import Client
-
+import asyncio
+import time
+import random
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
+    List,
     Literal,
     Optional,
+    Tuple,
     Union,
     cast,
+    ClassVar,
 )
+import traceback
 
 # Create tmp directory in current project directory
 log_dir = os.path.join(os.getcwd(), 'tmp', 'logs')
@@ -63,6 +73,9 @@ logging.basicConfig(
 
 # Print the log file location to console
 print(f"Log file location: {log_file}")
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 class DeepSeekR1ChatOpenAI(ChatOpenAI):
     
@@ -156,10 +169,7 @@ class DeepSeekR1ChatOllama(ChatOllama):
     ) -> AIMessage:
         org_ai_message = await super().ainvoke(input=input)
         org_content = org_ai_message.content
-        reasoning_content = org_content.split("</think>")[0].replace("<think>", "")
-        content = org_content.split("</think>")[1]
-        if "**JSON Response:**" in content:
-            content = content.split("**JSON Response:**")[-1]
+        reasoning_content, content = self._extract_reasoning_and_content(org_content)
         return AIMessage(content=content, reasoning_content=reasoning_content)
     
     def invoke(
@@ -172,27 +182,57 @@ class DeepSeekR1ChatOllama(ChatOllama):
     ) -> AIMessage:
         org_ai_message = super().invoke(input=input)
         org_content = org_ai_message.content
-        reasoning_content = org_content.split("</think>")[0].replace("<think>", "")
-        content = org_content.split("</think>")[1]
-        if "**JSON Response:**" in content:
-            content = content.split("**JSON Response:**")[-1]
+        reasoning_content, content = self._extract_reasoning_and_content(org_content)
         return AIMessage(content=content, reasoning_content=reasoning_content)
+
+    def _extract_reasoning_and_content(self, content: Union[str, list, dict]) -> Tuple[Optional[str], str]:
+        """Extract reasoning and content from response."""
+        try:
+            # Convert content to string if it's not already
+            if not isinstance(content, str):
+                content = str(content)
+            
+            # Split by think tags if present
+            if "<think>" in content and "</think>" in content:
+                parts = content.split("</think>", 1)
+                if len(parts) == 2:
+                    reasoning = parts[0].replace("<think>", "").strip()
+                    content = parts[1].strip()
+                else:
+                    reasoning = None
+                    content = content.strip()
+            else:
+                reasoning = None
+                content = content.strip()
+            
+            # Extract JSON response if present
+            if "**JSON Response:**" in content:
+                content = content.split("**JSON Response:**", 1)[1].strip()
+            
+            return reasoning, content
+            
+        except Exception as e:
+            logger.error(f"Error extracting reasoning and content: {str(e)}")
+            return None, str(content)
 
 class CustomAzureOpenAI(AzureChatOpenAI):
     """Custom Azure OpenAI wrapper with additional headers"""
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        base_url = ""
         api_version = kwargs.get("api_version", "2024-10-21")
         
-        # Ensure clean URL by removing any trailing slashes before adding query params
-        self._base_url = self._base_url.rstrip('/')
-        self._base_url = f"{self._base_url}?api-version={api_version}"
+        # Get base URL from azure_endpoint
+        base_url = kwargs.get("azure_endpoint", "").rstrip('/')
+        if not base_url:
+            base_url = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip('/')
+            
+        # Add API version to base URL
+        self._base_url = f"{base_url}?api-version={api_version}"
         
         logging.debug(f"Initializing CustomAzureOpenAI with base URL: {self._base_url}")
         
-        # Create headers dict first
+        # Create headers dict
         headers = {
             'Accept': 'application/json',
             'Content-Type': 'application/json',
@@ -208,7 +248,7 @@ class CustomAzureOpenAI(AzureChatOpenAI):
             api_key=kwargs.get("api_key", ""),
             default_headers=headers
         )
-        self.model_name = "gpt-35-turbo"
+        self.model_name = kwargs.get("model_name", "gpt-35-turbo")
         self.temperature = kwargs.get("temperature", 0.7)
         
     def _get_clean_url(self) -> str:
@@ -326,3 +366,256 @@ class CustomJSONEncoder(json.JSONEncoder):
         if hasattr(obj, '__class__') and obj.__class__.__name__ == 'Omit':
             return str(obj)  # or return a dict representation if available
         return super().default(obj)
+
+class CustomMistralAI(BaseChatModel):
+    def __init__(self, model_name="mistral-large-latest"):
+        """Initialize the Mistral AI client."""
+        super().__init__()
+        self.model_name = model_name
+        self.llm = ChatMistralAI(model_name=model_name)
+        self.logger = logging.getLogger(__name__)
+        self._last_request_time = 0
+        self._min_request_interval = 1.0  # Minimum time between requests in seconds
+
+    @property
+    def _llm_type(self) -> str:
+        """Return identifier of llm."""
+        return "custom_mistral"
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Generate a chat response."""
+        message_dicts = []
+        for message in messages:
+            if isinstance(message, SystemMessage):
+                message_dicts.append({"role": "system", "content": str(message.content)})
+            elif isinstance(message, AIMessage):
+                message_dicts.append({"role": "assistant", "content": str(message.content)})
+            else:
+                message_dicts.append({"role": "user", "content": str(message.content)})
+
+        try:
+            self._wait_for_rate_limit()
+            response = self.llm.invoke(messages)
+            if isinstance(response, AIMessage):
+                content = response.content
+            else:
+                content = str(response)
+            
+            generation = ChatGeneration(message=AIMessage(content=content))
+            return ChatResult(generations=[generation])
+            
+        except Exception as e:
+            error_msg = f"Error in _generate: {str(e)}"
+            logging.error(error_msg)
+            raise
+
+    def _wait_for_rate_limit(self):
+        """Wait if needed to respect rate limits."""
+        current_time = time.time()
+        time_since_last_request = current_time - self._last_request_time
+        if time_since_last_request < self._min_request_interval:
+            sleep_time = self._min_request_interval - time_since_last_request
+            time.sleep(sleep_time)
+        self._last_request_time = time.time()
+
+    async def _async_wait_for_rate_limit(self):
+        """Asynchronously wait if needed to respect rate limits."""
+        current_time = time.time()
+        time_since_last_request = current_time - self._last_request_time
+        if time_since_last_request < self._min_request_interval:
+            sleep_time = self._min_request_interval - time_since_last_request
+            await asyncio.sleep(sleep_time)
+        self._last_request_time = time.time()
+
+    async def ainvoke(
+        self,
+        input: LanguageModelInput,
+        config: Optional[RunnableConfig] = None,
+        **kwargs: Any
+    ) -> AIMessage:
+        """
+        Asynchronously invoke the model with retry logic and improved error handling.
+        
+        Args:
+            input: The input to send to the model
+            config: Optional configuration
+            **kwargs: Additional arguments
+            
+        Returns:
+            AIMessage containing the model's response
+        """
+        max_retries = kwargs.get('max_retries', 3)
+        base_delay = kwargs.get('base_delay', 1.0)
+        last_error = None
+
+        messages = convert_to_messages(input)
+
+        for attempt in range(max_retries):
+            try:
+                await self._async_wait_for_rate_limit()
+                logging.debug("Making API call to Mistral...")
+                raw_response = await self.llm.ainvoke(messages)
+                
+                # Log the raw response type and content for debugging
+                logging.debug(f"Raw response type: {type(raw_response)}")
+                logging.debug(f"Raw response: {raw_response}")
+                
+                # If the response is already an AIMessage, return it
+                if isinstance(raw_response, AIMessage):
+                    return raw_response
+                
+                # Otherwise, convert the response to an AIMessage
+                if isinstance(raw_response, str):
+                    return AIMessage(content=raw_response)
+                else:
+                    return AIMessage(content=str(raw_response))
+                
+            except Exception as e:
+                last_error = e
+                if "rate limit exceeded" in str(e).lower():
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff for rate limits
+                else:
+                    delay = base_delay * (attempt + 1)  # Linear backoff for other errors
+                logging.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+        
+        # If all retries failed, raise a RuntimeError with the error message
+        error_msg = f"Failed after {max_retries} attempts. Last error: {str(last_error)}"
+        logging.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    def invoke(
+        self,
+        input: LanguageModelInput,
+        config: Optional[RunnableConfig] = None,
+        **kwargs: Any
+    ) -> AIMessage:
+        """
+        Invoke the model with retry logic and improved error handling.
+        
+        Args:
+            input: The input to send to the model
+            config: Optional configuration
+            **kwargs: Additional arguments
+            
+        Returns:
+            AIMessage containing the model's response
+        """
+        max_retries = kwargs.get('max_retries', 3)
+        base_delay = kwargs.get('base_delay', 1.0)
+        last_error = None
+
+        messages = convert_to_messages(input)
+
+        for attempt in range(max_retries):
+            try:
+                self._wait_for_rate_limit()
+                logging.debug("Making API call to Mistral...")
+                raw_response = self.llm.invoke(messages)
+                
+                # Log the raw response type and content for debugging
+                logging.debug(f"Raw response type: {type(raw_response)}")
+                logging.debug(f"Raw response: {raw_response}")
+                
+                # If the response is already an AIMessage, return it
+                if isinstance(raw_response, AIMessage):
+                    return raw_response
+                
+                # Otherwise, convert the response to an AIMessage
+                if isinstance(raw_response, str):
+                    return AIMessage(content=raw_response)
+                else:
+                    return AIMessage(content=str(raw_response))
+                
+            except Exception as e:
+                last_error = e
+                if "rate limit exceeded" in str(e).lower():
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff for rate limits
+                else:
+                    delay = base_delay * (attempt + 1)  # Linear backoff for other errors
+                logging.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(delay)
+        
+        # If all retries failed, raise a RuntimeError with the error message
+        error_msg = f"Failed after {max_retries} attempts. Last error: {str(last_error)}"
+        logging.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    def _process_string_response(self, response: str) -> Dict[str, Any]:
+        """Process a string response into the required format."""
+        return {
+            "current_state": {
+                "summary": response,
+                "thought": response,
+                "task_progress": "Processed string response",
+                "future_plans": "Continue with next action"
+            }
+        }
+
+    def _process_response(self, response) -> Dict[str, Any]:
+        """Process a structured response into the required format."""
+        try:
+            if hasattr(response, 'content'):
+                content = response.content
+            else:
+                content = str(response)
+            
+            # Try to parse as JSON if it looks like JSON
+            if isinstance(content, str) and content.strip().startswith('{'):
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and 'current_state' in parsed:
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+                
+            # If not JSON or parsing failed, create a structured response
+            return {
+                "current_state": {
+                    "summary": content,
+                    "thought": content,
+                    "task_progress": "Processed structured response",
+                    "future_plans": "Continue with next action"
+                }
+            }
+            
+        except Exception as e:
+            logging.error(f"Error processing response: {str(e)}")
+            return {
+                "current_state": {
+                    "summary": f"Error processing response: {str(e)}",
+                    "thought": "Failed to process response",
+                    "task_progress": "Error occurred",
+                    "future_plans": "Retry with different parameters"
+                }
+            }
+
+    def _log_response_details(self, response):
+        """Log details about the response for debugging."""
+        try:
+            # Handle both string and object responses
+            content = response.content if hasattr(response, 'content') else str(response)
+            truncated_content = content[:500] + '...' if len(content) > 500 else content
+            
+            details = {
+                'type': type(response).__name__,
+                'content': truncated_content
+            }
+            
+            if hasattr(response, 'additional_kwargs'):
+                details['additional_kwargs'] = response.additional_kwargs
+                
+            if hasattr(response, 'response_metadata'):
+                details['metadata'] = response.response_metadata
+                
+            logging.debug("📥 Response Details:\n%s", json.dumps(details, indent=2))
+        except Exception as e:
+            logging.error("Error logging request details: %s", str(e))

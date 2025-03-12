@@ -29,6 +29,10 @@ def default_config():
         "save_trace_path": "./tmp/traces",
         "save_agent_history_path": "./tmp/agent_history",
         "task": "go to google.com and type 'OpenAI' click search and give me the first url",
+        # Default tasks for multi-agent tab
+        "task1": "Go to google.com, search for 'Latest AI developments', click on the most recent news article, and summarize the key points.",
+        "task2": "Visit github.com, search for 'AI agents', find a popular repository, and extract its main features and star count.",
+        "task3": "Navigate to arxiv.org, search for 'multi-agent systems', find the most recent paper, and provide its title and abstract."
     }
 
 

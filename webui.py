@@ -1,5 +1,6 @@
 import pdb
 import logging
+import json
 
 from dotenv import load_dotenv
 
@@ -45,32 +46,17 @@ _global_agent = None
 _global_agent_state = AgentState()
 
 async def stop_agent():
-    """Request the agent to stop and update UI with enhanced feedback"""
-    global _global_agent_state, _global_browser_context, _global_browser, _global_agent
-
+    """Stop the currently running agent"""
     try:
-        # Request stop
-        _global_agent.stop()
-
-        # Update UI immediately
-        message = "Stop requested - the agent will halt at the next safe point"
-        logger.info(f"🛑 {message}")
-
-        # Return UI updates
-        return (
-            message,                                        # errors_output
-            gr.update(value="Stopping...", interactive=False),  # stop_button
-            gr.update(interactive=False),                      # run_button
-        )
+        if '_global_agent' in globals() and _global_agent is not None and hasattr(_global_agent, 'stop'):
+            if asyncio.iscoroutinefunction(_global_agent.stop):
+                await _global_agent.stop()
+            else:
+                _global_agent.stop()
+        return '', gr.update(value="Stop", interactive=True), gr.update(interactive=True)
     except Exception as e:
-        error_msg = f"Error during stop: {str(e)}"
-        logger.error(error_msg)
-        return (
-            error_msg,
-            gr.update(value="Stop", interactive=True),
-            gr.update(interactive=True)
-        )
-        
+        return f"Error stopping agent: {str(e)}", gr.update(value="Stop", interactive=True), gr.update(interactive=True)
+
 async def stop_research_agent():
     """Request the agent to stop and update UI with enhanced feedback"""
     global _global_agent_state, _global_browser_context, _global_browser
@@ -658,12 +644,275 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
     return markdown_content, file_path, gr.update(value="Stop", interactive=True),  gr.update(interactive=True) 
     
 
+async def run_multiple_agents(
+    agent_type,
+    llm_provider,
+    llm_model_name,
+    llm_num_ctx,
+    llm_temperature,
+    llm_base_url,
+    llm_api_key,
+    use_own_browser,
+    keep_browser_open,
+    headless,
+    disable_security,
+    window_w,
+    window_h,
+    save_recording_path,
+    save_agent_history_path,
+    save_trace_path,
+    enable_recording,
+    task1,
+    task2,
+    task3,
+    add_infos,
+    max_steps,
+    use_vision,
+    max_actions_per_step,
+    tool_calling_method
+):
+    # Create browsers list
+    browsers = []
+    browser_contexts = []
+    
+    # Initialize task_results with empty dictionaries
+    task_results = [
+        {
+            'final_result': '',
+            'errors': '',
+            'model_actions': '',
+            'model_thoughts': '',
+            'trace_file': None,
+            'history_file': None
+        } for _ in range(3)
+    ]
+    
+    try:
+        # Create API rate limiter semaphore
+        api_rate_limiter = asyncio.Semaphore(2)  # Allow 2 concurrent API calls
+        
+        # Create browsers for each task
+        for _ in range(3):
+            extra_chromium_args = [f"--window-size={window_w},{window_h}"]
+            if use_own_browser:
+                chrome_path = os.getenv("CHROME_PATH", None)
+                if chrome_path == "":
+                    chrome_path = None
+                chrome_user_data = os.getenv("CHROME_USER_DATA", None)
+                if chrome_user_data:
+                    extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
+            else:
+                chrome_path = None
+                
+            browser = CustomBrowser(
+                config=BrowserConfig(
+                    headless=headless,
+                    disable_security=disable_security,
+                    chrome_instance_path=chrome_path,
+                    extra_chromium_args=extra_chromium_args,
+                )
+            )
+            browsers.append(browser)
+        
+        async def run_agent_with_rate_limit(task_idx, task_text):
+            if not task_text.strip():  # Skip empty tasks
+                return None
+                
+            try:
+                # Create browser context for this task
+                browser_context = await browsers[task_idx].new_context(
+                    config=BrowserContextConfig(
+                        trace_path=os.path.join(save_trace_path, f"task_{task_idx+1}") if save_trace_path else None,
+                        save_recording_path=os.path.join(save_recording_path, f"task_{task_idx+1}") if save_recording_path else None,
+                        no_viewport=False,
+                        browser_window_size=BrowserContextWindowSize(
+                            width=window_w, height=window_h
+                        ),
+                    )
+                )
+                browser_contexts.append(browser_context)
+                
+                async with api_rate_limiter:  # Only rate limit the API calls
+                    # Create LLM instance for this task
+                    llm = utils.get_llm_model(
+                        provider=llm_provider,
+                        model_name=llm_model_name,
+                        num_ctx=llm_num_ctx,
+                        temperature=llm_temperature,
+                        base_url=llm_base_url,
+                        api_key=llm_api_key,
+                    )
+                
+                    # Create controller for this task
+                    controller = CustomController()
+                    
+                    # Create agent for this task
+                    agent = CustomAgent(
+                        task=task_text,
+                        add_infos=add_infos,
+                        use_vision=use_vision,
+                        llm=llm,
+                        browser=browsers[task_idx],
+                        browser_context=browser_context,
+                        controller=controller,
+                        system_prompt_class=CustomSystemPrompt,
+                        agent_prompt_class=CustomAgentMessagePrompt,
+                        max_actions_per_step=max_actions_per_step,
+                        tool_calling_method=tool_calling_method
+                    )
+                    
+                    # Run the agent
+                    history = await agent.run(max_steps=max_steps)
+                    
+                    # Save history file
+                    history_file = os.path.join(
+                        os.path.join(save_agent_history_path, f"task_{task_idx+1}"), 
+                        f"agent_{task_idx+1}.json"
+                    )
+                    os.makedirs(os.path.dirname(history_file), exist_ok=True)
+                    agent.save_history(history_file)
+                    
+                    # Get final result from history
+                    final_result = history.final_result()
+                    if not final_result:  # If final_result is empty, try to get it from the last thought
+                        thoughts = history.model_thoughts()
+                        if thoughts and len(thoughts) > 0:
+                            final_result = str(thoughts[-1])  # Get the last thought as result
+                    
+                    # Return task results with guaranteed non-empty final result
+                    return {
+                        'final_result': final_result if final_result else f"Task {task_idx+1} completed",
+                        'errors': history.errors(),
+                        'model_actions': history.model_actions(),
+                        'model_thoughts': history.model_thoughts(),
+                        'trace_file': get_latest_files(os.path.join(save_trace_path, f"task_{task_idx+1}")).get('.zip'),
+                        'history_file': history_file
+                    }
+            except Exception as e:
+                import traceback
+                error_msg = f"Task {task_idx+1} error: {str(e)}\n{traceback.format_exc()}"
+                logger.error(error_msg)
+                # Return the error result with a clear final result message
+                return {
+                    'final_result': f"Task {task_idx+1} failed: {str(e)}",
+                    'errors': error_msg,
+                    'model_actions': '',
+                    'model_thoughts': '',
+                    'trace_file': None,
+                    'history_file': None
+                }
+
+        # Create tasks list with non-empty tasks
+        tasks = [(idx, task) for idx, task in enumerate([task1, task2, task3]) if task.strip()]
+        
+        # Create a queue for UI updates
+        ui_update_queue = asyncio.Queue()
+        
+        async def run_task_and_queue_update(task_idx, task_text):
+            result = await run_agent_with_rate_limit(task_idx, task_text)
+            if result is not None:
+                task_results[task_idx] = result
+                await ui_update_queue.put((task_idx, result))  # Queue the task index and result
+        
+        # Start all tasks concurrently
+        running_tasks = [asyncio.create_task(run_task_and_queue_update(idx, text)) for idx, text in tasks]
+        
+        # Process UI updates as they come in
+        while running_tasks:
+            done, pending = await asyncio.wait(running_tasks, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+            running_tasks = list(pending)
+            
+            # Process any completed tasks
+            for task in done:
+                try:
+                    await task  # Ensure any exceptions are raised
+                except Exception as e:
+                    logger.error(f"Task error: {str(e)}")
+            
+            # Update UI with current results - matching all UI components
+            yield (
+                task_results[0]['final_result'],     # Task 1 result
+                task_results[1]['final_result'],     # Task 2 result
+                task_results[2]['final_result'],     # Task 3 result
+                task_results[0]['errors'],           # Task 1 errors
+                task_results[1]['errors'],           # Task 2 errors
+                task_results[2]['errors'],           # Task 3 errors
+                task_results[0]['model_actions'],    # Task 1 actions
+                task_results[1]['model_actions'],    # Task 2 actions
+                task_results[2]['model_actions'],    # Task 3 actions
+                task_results[0]['model_thoughts'],   # Task 1 thoughts
+                task_results[1]['model_thoughts'],   # Task 2 thoughts
+                task_results[2]['model_thoughts'],   # Task 3 thoughts
+                task_results[0]['trace_file'],       # Task 1 trace
+                task_results[1]['trace_file'],       # Task 2 trace
+                task_results[2]['trace_file'],       # Task 3 trace
+                task_results[0]['history_file'],     # Task 1 history
+                task_results[1]['history_file'],     # Task 2 history
+                task_results[2]['history_file'],     # Task 3 history
+                gr.update(value="Stop", interactive=True),  # Stop button
+                gr.update(interactive=True)                 # Run button
+            )
+            
+        # Final UI update with the same structure
+        yield (
+            task_results[0]['final_result'],     # Task 1 result
+            task_results[1]['final_result'],     # Task 2 result
+            task_results[2]['final_result'],     # Task 3 result
+            task_results[0]['errors'],           # Task 1 errors
+            task_results[1]['errors'],           # Task 2 errors
+            task_results[2]['errors'],           # Task 3 errors
+            task_results[0]['model_actions'],    # Task 1 actions
+            task_results[1]['model_actions'],    # Task 2 actions
+            task_results[2]['model_actions'],    # Task 3 actions
+            task_results[0]['model_thoughts'],   # Task 1 thoughts
+            task_results[1]['model_thoughts'],   # Task 2 thoughts
+            task_results[2]['model_thoughts'],   # Task 3 thoughts
+            task_results[0]['trace_file'],       # Task 1 trace
+            task_results[1]['trace_file'],       # Task 2 trace
+            task_results[2]['trace_file'],       # Task 3 trace
+            task_results[0]['history_file'],     # Task 1 history
+            task_results[1]['history_file'],     # Task 2 history
+            task_results[2]['history_file'],     # Task 3 history
+            gr.update(value="Stop", interactive=True),  # Stop button
+            gr.update(interactive=True)                 # Run button
+        )
+    except Exception as e:
+        import traceback
+        error_msg = f"Error running multiple agents: {str(e)}\n{traceback.format_exc()}"
+        logger.error(error_msg)
+        # Return empty/error values for all 20 expected outputs
+        yield (
+            "", "", "",                          # Final results
+            error_msg, error_msg, error_msg,     # Errors
+            "", "", "",                          # Model actions
+            "", "", "",                          # Model thoughts
+            None, None, None,                    # Trace files
+            None, None, None,                    # History files
+            gr.update(value="Stop", interactive=True),  # Stop button
+            gr.update(interactive=True)                 # Run button
+        )
+    finally:
+        # Clean up resources
+        for context in browser_contexts:
+            try:
+                await context.close()
+            except Exception as e:
+                logger.error(f"Error closing browser context: {str(e)}")
+                
+        if not keep_browser_open:
+            for browser in browsers:
+                try:
+                    await browser.close()
+                except Exception as e:
+                    logger.error(f"Error closing browser: {str(e)}")
+
 def create_ui(config, theme_name="Ocean"):
     css = """
     .gradio-container {
         max-width: 1200px !important;
         margin: auto !important;
         padding-top: 20px !important;
+        padding-bottom: 20px !important;
     }
     .header-text {
         text-align: center;
@@ -673,6 +922,15 @@ def create_ui(config, theme_name="Ocean"):
         margin-bottom: 20px;
         padding: 15px;
         border-radius: 10px;
+    }
+    .tab-content {
+        padding: 20px !important;
+    }
+    .output-section {
+        margin-top: 20px;
+        padding: 15px;
+        border-radius: 10px;
+        background-color: rgba(0, 0, 0, 0.05);
     }
     """
 
@@ -724,9 +982,9 @@ def create_ui(config, theme_name="Ocean"):
                             label="Tool Calling Method",
                             value=config['tool_calling_method'],
                             interactive=True,
-                            allow_custom_value=True,  # Allow users to input custom model names
+                            allow_custom_value=True,
                             choices=["auto", "json_schema", "function_calling"],
-                            info="Tool Calls Funtion Name",
+                            info="Tool Calls Function Name",
                             visible=False
                         )
 
@@ -743,7 +1001,7 @@ def create_ui(config, theme_name="Ocean"):
                         choices=utils.model_names['openai'],
                         value=config['llm_model_name'],
                         interactive=True,
-                        allow_custom_value=True,  # Allow users to input custom model names
+                        allow_custom_value=True,
                         info="Select a model from the dropdown or type a custom model name"
                     )
                     llm_num_ctx = gr.Slider(
@@ -775,17 +1033,6 @@ def create_ui(config, theme_name="Ocean"):
                             value=config['llm_api_key'],
                             info="Your API key (leave blank to use .env)"
                         )
-
-            # Change event to update context length slider
-            def update_llm_num_ctx_visibility(llm_provider):
-                return gr.update(visible=llm_provider == "ollama")
-
-            # Bind the change event of llm_provider to update the visibility of context length slider
-            llm_provider.change(
-                fn=update_llm_num_ctx_visibility,
-                inputs=llm_provider,
-                outputs=llm_num_ctx
-            )
 
             with gr.TabItem("🌐 Browser Settings", id=3):
                 with gr.Group():
@@ -833,7 +1080,7 @@ def create_ui(config, theme_name="Ocean"):
                         placeholder="e.g. ./tmp/record_videos",
                         value=config['save_recording_path'],
                         info="Path to save browser recordings",
-                        interactive=True,  # Allow editing only if recording is enabled
+                        interactive=True,
                     )
 
                     save_trace_path = gr.Textbox(
@@ -875,9 +1122,98 @@ def create_ui(config, theme_name="Ocean"):
                     browser_view = gr.HTML(
                         value="<h1 style='width:80vw; height:50vh'>Waiting for browser session...</h1>",
                         label="Live Browser View",
+                    )
+
+            with gr.TabItem("🚀 Multi-Agent", id=5):
+                task1 = gr.Textbox(
+                    label="Task 1 Description",
+                    lines=3,
+                    placeholder="Enter first task here...",
+                    value=config['task1'],
+                    info="Describe what you want the first agent to do",
                 )
-            
-            with gr.TabItem("🧐 Deep Research", id=5):
+                task2 = gr.Textbox(
+                    label="Task 2 Description",
+                    lines=3,
+                    placeholder="Enter second task here...",
+                    value=config['task2'],
+                    info="Describe what you want the second agent to do",
+                )
+                task3 = gr.Textbox(
+                    label="Task 3 Description",
+                    lines=3,
+                    placeholder="Enter third task here...",
+                    value=config['task3'],
+                    info="Describe what you want the third agent to do",
+                )
+
+                with gr.Row():
+                    multi_run_button = gr.Button("▶️ Run Multiple Agents", variant="primary", scale=2)
+                    multi_stop_button = gr.Button("⏹️ Stop All", variant="stop", scale=1)
+
+                # Add output components for multi-agent with separate result boxes
+                with gr.Group(elem_classes=["output-section"]):
+                    gr.Markdown("### Multi-Agent Results")
+                    
+                    # Task 1 Results
+                    with gr.Group():
+                        gr.Markdown("#### Task 1 Results")
+                        task1_result = gr.Textbox(label="Final Result", lines=5, interactive=False)
+                        task1_error = gr.Textbox(label="Errors", lines=2, interactive=False, visible=True)
+                        task1_actions = gr.Textbox(label="Model Actions", lines=3, interactive=False)
+                        task1_thoughts = gr.Textbox(label="Model Thoughts", lines=3, interactive=False)
+                        task1_trace = gr.File(label="Trace File")
+                        task1_history = gr.File(label="History File")
+                    
+                    # Task 2 Results
+                    with gr.Group():
+                        gr.Markdown("#### Task 2 Results")
+                        task2_result = gr.Textbox(label="Final Result", lines=5, interactive=False)
+                        task2_error = gr.Textbox(label="Errors", lines=2, interactive=False, visible=True)
+                        task2_actions = gr.Textbox(label="Model Actions", lines=3, interactive=False)
+                        task2_thoughts = gr.Textbox(label="Model Thoughts", lines=3, interactive=False)
+                        task2_trace = gr.File(label="Trace File")
+                        task2_history = gr.File(label="History File")
+                    
+                    # Task 3 Results
+                    with gr.Group():
+                        gr.Markdown("#### Task 3 Results")
+                        task3_result = gr.Textbox(label="Final Result", lines=5, interactive=False)
+                        task3_error = gr.Textbox(label="Errors", lines=2, interactive=False, visible=True)
+                        task3_actions = gr.Textbox(label="Model Actions", lines=3, interactive=False)
+                        task3_thoughts = gr.Textbox(label="Model Thoughts", lines=3, interactive=False)
+                        task3_trace = gr.File(label="Trace File")
+                        task3_history = gr.File(label="History File")
+
+                # Multi-agent run button click handler
+                multi_run_button.click(
+                    fn=run_multiple_agents,
+                    inputs=[
+                        agent_type, llm_provider, llm_model_name, llm_num_ctx, llm_temperature, llm_base_url, llm_api_key,
+                        use_own_browser, keep_browser_open, headless, disable_security, window_w, window_h,
+                        save_recording_path, save_agent_history_path, save_trace_path,
+                        enable_recording, task1, task2, task3, add_infos, max_steps, use_vision, max_actions_per_step, tool_calling_method
+                    ],
+                    outputs=[
+                        task1_result, task2_result, task3_result,  # Final results
+                        task1_error, task2_error, task3_error,     # Errors
+                        task1_actions, task2_actions, task3_actions,  # Model actions
+                        task1_thoughts, task2_thoughts, task3_thoughts,  # Model thoughts
+                        task1_trace, task2_trace, task3_trace,     # Trace files
+                        task1_history, task2_history, task3_history,  # History files
+                        multi_stop_button, multi_run_button        # Buttons
+                    ],
+                    show_progress="full"
+                )
+
+                # Multi-agent stop button click handler
+                multi_stop_button.click(
+                    fn=stop_agent,
+                    inputs=[],
+                    outputs=[task1_error, multi_stop_button, multi_run_button]
+                )
+
+            with gr.TabItem("🧐 Deep Research", id=6):
                 research_task_input = gr.Textbox(label="Research Task", lines=5, value="Compose a report on the use of Reinforcement Learning for training Large Language Models, encompassing its origins, current advancements, and future prospects, substantiated with examples of relevant models and techniques. The report should reflect original insights and analysis, moving beyond mere summarization of existing literature.")
                 with gr.Row():
                     max_search_iteration_input = gr.Number(label="Max Search Iteration", value=3, precision=0) # precision=0 确保是整数
@@ -889,7 +1225,7 @@ def create_ui(config, theme_name="Ocean"):
                 markdown_download = gr.File(label="Download Research Report")
 
 
-            with gr.TabItem("📊 Results", id=6):
+            with gr.TabItem("📊 Results", id=7):
                 with gr.Group():
 
                     recording_display = gr.Video(label="Latest Recording")
@@ -961,7 +1297,7 @@ def create_ui(config, theme_name="Ocean"):
                     outputs=[stop_research_button, research_button],
                 )
 
-            with gr.TabItem("🎥 Recordings", id=7):
+            with gr.TabItem("🎥 Recordings", id=8):
                 def list_recordings(save_recording_path):
                     if not os.path.exists(save_recording_path):
                         return []
@@ -995,7 +1331,7 @@ def create_ui(config, theme_name="Ocean"):
                     outputs=recordings_gallery
                 )
             
-            with gr.TabItem("📁 Configuration", id=8):
+            with gr.TabItem("📁 Configuration", id=9):
                 with gr.Group():
                     config_file_input = gr.File(
                         label="Load Config File",
@@ -1059,7 +1395,7 @@ def create_ui(config, theme_name="Ocean"):
 def main():
     parser = argparse.ArgumentParser(description="Gradio UI for Browser Agent")
     parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
-    parser.add_argument("--port", type=int, default=None, help="Port to listen on")
+    parser.add_argument("--port", type=int, default=7788, help="Port to listen on")
     parser.add_argument("--theme", type=str, default="Ocean", choices=theme_map.keys(), help="Theme to use for the UI")
     parser.add_argument("--dark-mode", action="store_true", help="Enable dark mode")
     args = parser.parse_args()
