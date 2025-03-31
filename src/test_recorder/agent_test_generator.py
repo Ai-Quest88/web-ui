@@ -5,8 +5,7 @@ import logging
 import subprocess
 import tempfile
 import time
-import asyncio
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, cast
 from langchain_mistralai import ChatMistralAI
 from langchain.schema import HumanMessage
 from pydantic import SecretStr
@@ -18,11 +17,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Mistral API key from environment (or hardcode for testing)
+# Mistral API key from environment
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "3LwHm6LjdjaooZwnEAHPjtpaJfjIHesg")
 
 class AITestAgent:
-    """Agent that directly generates and executes Playwright tests using Mistral LLM"""
+    """Agent that generates and executes Playwright tests using best practices"""
     
     def __init__(self):
         self.task_description = ""
@@ -40,6 +39,33 @@ class AITestAgent:
     async def generate_test_code(self, error_message: Optional[str] = None) -> str:
         """Generate Playwright test code directly based on task description"""
         logger.info("Generating Playwright test code...")
+        
+        page_context = """
+        Best Practices for Web UI Testing:
+        1. Locator Priority (from most to least stable):
+           - test-id/data-testid attributes (e.g. [data-testid="submit-button"])
+           - ARIA roles and labels (e.g. getByRole('button', { name: 'Submit' }))
+           - Semantic HTML (e.g. getByRole('navigation'), getByRole('main'))
+           - Form labels and text content (e.g. getByLabel('Username'), getByText('Submit'))
+           - IDs and unique attributes (only if they are stable)
+           - CSS selectors (last resort, as they are fragile)
+
+        2. Important Waiting Strategies:
+           - Wait for elements to be visible before interaction
+           - Wait for network requests to complete after actions
+           - Wait for dynamic content to load
+           - Handle loading states and transitions
+           - Consider animation completion
+
+        3. Common UI Patterns:
+           - Navigation menus and breadcrumbs
+           - Search functionality (input, suggestions, results)
+           - Forms and validation
+           - Modals and overlays
+           - Infinite scroll and pagination
+           - Dynamic content loading
+           - Error states and messages
+        """
         
         retry_context = ""
         if error_message:
@@ -60,6 +86,8 @@ class AITestAgent:
         3. Include proper error handling and waiting strategies
         4. Include all necessary imports
         5. The test should be standalone and runnable with Playwright
+        6. Follow these best practices for web testing:
+        {page_context}
         {retry_context}
         
         Return format (ONLY Python code, no documentation or markdown):
@@ -71,7 +99,7 @@ class AITestAgent:
         """
         
         response = await self.llm.ainvoke([HumanMessage(content=prompt)])
-        code = response.content
+        code = cast(str, response.content)
         
         # Extract code from response
         return self._extract_code_from_response(code)
@@ -87,7 +115,7 @@ class AITestAgent:
         
         try:
             # Ensure dependencies are installed
-            logger.info("Ensuring Playwright is installed...")
+            logger.info("Ensuring dependencies are installed...")
             try:
                 subprocess.run(
                     ["pip", "install", "playwright"],
@@ -102,7 +130,7 @@ class AITestAgent:
                     stderr=subprocess.PIPE
                 )
             except subprocess.CalledProcessError:
-                logger.warning("Playwright installation may have issues, but continuing...")
+                logger.warning("Dependency installation may have issues, but continuing...")
             
             # Execute the test
             logger.info(f"Running test from {temp_filename}...")
@@ -110,7 +138,7 @@ class AITestAgent:
                 ["python", temp_filename],
                 capture_output=True,
                 text=True,
-                timeout=60  # Add timeout to prevent infinite hangs
+                timeout=120  # Increase timeout for more complex tasks
             )
             
             # Check if the test passed
@@ -144,18 +172,25 @@ class AITestAgent:
         ```
         
         Please analyze the error and explain what went wrong and how to fix it.
+        Focus on:
+        1. Element visibility and timing issues
+        2. Selector reliability and uniqueness
+        3. Page load and network states
+        4. Dynamic content loading
+        5. Error handling improvements
+        
         Be specific about what needs to change in the code.
         """
         
         response = await self.llm.ainvoke([HumanMessage(content=prompt)])
-        analysis = response.content
+        analysis = cast(str, response.content)
         logger.info(f"Analysis: {analysis}")
         return analysis
     
     async def run_with_retry(self, max_attempts: int = 3) -> bool:
         """Generate and run test with retry logic"""
-        error_message = None
-        test_code = None
+        error_message: Optional[str] = None
+        test_code: Optional[str] = None
         
         for attempt in range(max_attempts):
             logger.info(f"Test attempt {attempt + 1}/{max_attempts}")
@@ -176,8 +211,9 @@ class AITestAgent:
             if attempt < max_attempts - 1:
                 logger.info(f"Retrying... ({attempt + 2}/{max_attempts})")
                 # Let the agent analyze the error to inform the next generation
-                analysis = await self.analyze_error(test_code, error_message)
-                error_message = f"{error_message}\n\nAnalysis: {analysis}"
+                if error_message and test_code:
+                    analysis = await self.analyze_error(test_code, error_message)
+                    error_message = f"{error_message}\n\nAnalysis: {analysis}"
                 time.sleep(1)  # Small delay before retry
             else:
                 logger.error(f"All {max_attempts} attempts failed")
@@ -220,7 +256,11 @@ class AITestAgent:
 
 async def main():
     """Main function to run the AI test agent"""
-    task_description = "Navigate to GitHub homepage and verify the title is displayed correctly"
+    task_description = """Navigate to https://demo.playwright.dev/todomvc/, then:
+    1. Add three todo items: 'Buy groceries', 'Clean house', 'Walk dog'
+    2. Mark 'Clean house' as completed
+    3. Verify the remaining active items count is 2
+    4. Verify 'Clean house' is shown as completed"""
     
     logger.info(f"Starting AI test agent with task: {task_description}")
     
@@ -238,4 +278,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
+    asyncio.run(main()) 
