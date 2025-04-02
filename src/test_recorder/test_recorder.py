@@ -25,7 +25,12 @@ browser = Browser(
 		new_context_config=BrowserContextConfig(save_recording_path='./tmp/recordings'),
 	)
 )
-llm = ChatMistralAI(model_name="mistral-large-latest", temperature=0.0, api_key=SecretStr("3LwHm6LjdjaooZwnEAHPjtpaJfjIHesg"))
+
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+if not MISTRAL_API_KEY:
+	raise ValueError("MISTRAL_API_KEY environment variable is required")
+
+llm = ChatMistralAI(model_name="mistral-large-latest", temperature=0.0, api_key=SecretStr(MISTRAL_API_KEY))
 
 async def main():
 	# Create the recorded_tests directory if it doesn't exist
