@@ -40,10 +40,15 @@ from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Sof
 from src.utils.default_config_settings import default_config, load_config_from_file, save_config_to_file, save_current_config, update_ui_from_config
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot
 
-async def generate_test(task_description: str):
+async def generate_test(task_description: str, llm_provider: str, llm_model_name: str, llm_api_key: str, llm_base_url: str):
     """Generate test code based on task description"""
     try:
-        agent = AITestAgent()
+        agent = AITestAgent(
+            llm_provider=llm_provider,
+            llm_model_name=llm_model_name,
+            llm_api_key=llm_api_key,
+            llm_base_url=llm_base_url
+        )
         
         # Initial state
         yield "", gr.update(visible=False), gr.update(interactive=False), gr.update(visible=False), gr.update(visible=False), "Starting test generation..."
@@ -137,10 +142,15 @@ async def generate_test(task_description: str):
             error_msg
         )
 
-async def execute_test(test_code: str):
+async def execute_test(test_code: str, llm_provider: str, llm_model_name: str, llm_api_key: str, llm_base_url: str):
     """Execute generated test code"""
     try:
-        agent = AITestAgent()
+        agent = AITestAgent(
+            llm_provider=llm_provider,
+            llm_model_name=llm_model_name,
+            llm_api_key=llm_api_key,
+            llm_base_url=llm_base_url
+        )
         
         # Initial state
         yield (
@@ -1679,27 +1689,14 @@ def create_ui():
 
         generate_button.click(
             fn=generate_test,
-            inputs=[task_input],
-            outputs=[
-                test_code,
-                error_output,
-                execute_button,
-                video_output,
-                video_file,
-                logs_output
-            ]
+            inputs=[task_input, llm_provider, llm_model_name, llm_api_key, llm_base_url],
+            outputs=[test_code, error_output, execute_button, video_output, video_file, logs_output]
         )
 
         execute_button.click(
             fn=execute_test,
-            inputs=[test_code],
-            outputs=[
-                error_output,
-                screenshot_output,
-                video_output,
-                video_file,
-                logs_output
-            ]
+            inputs=[test_code, llm_provider, llm_model_name, llm_api_key, llm_base_url],
+            outputs=[error_output, screenshot_output, video_output, video_file, logs_output]
         )
 
         return demo

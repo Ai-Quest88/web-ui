@@ -6,9 +6,9 @@ import subprocess
 import tempfile
 import time
 from typing import Dict, Any, Optional, Tuple, cast, Union, List, Mapping
-from langchain_mistralai import ChatMistralAI
 from langchain.schema import HumanMessage
 from pydantic import SecretStr
+from src.utils import utils
 
 # Set up logging
 logging.basicConfig(
@@ -17,20 +17,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Mistral API key from environment
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
-if not MISTRAL_API_KEY:
-    raise ValueError("MISTRAL_API_KEY environment variable is required")
-
 class AITestAgent:
     """Agent that generates and executes Playwright tests using best practices"""
     
-    def __init__(self):
+    def __init__(self, llm_provider: str = "openai", llm_model_name: str = None, llm_api_key: str = None, llm_base_url: str = None):
         self.task_description = ""
-        self.llm = ChatMistralAI(
-            model_name="mistral-large-latest",
-            temperature=0.0,
-            api_key=SecretStr(MISTRAL_API_KEY)
+        self.llm = utils.get_llm_model(
+            provider=llm_provider,
+            model_name=llm_model_name,
+            api_key=llm_api_key,
+            base_url=llm_base_url,
+            temperature=0.0
         )
         self.logs = []
     
