@@ -41,7 +41,28 @@ from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Sof
 from src.utils.default_config_settings import default_config, load_config_from_file, save_config_to_file, save_current_config, update_ui_from_config
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot
 
-async def generate_test(task_description: str, llm_provider: str, llm_model_name: str, llm_api_key: str, llm_base_url: str = "") -> tuple:
+async def generate_test(
+    task_description: str, 
+    llm_provider: str, 
+    llm_model_name: str, 
+    llm_api_key: str, 
+    llm_base_url: str = "",
+    # Browser settings
+    use_own_browser: bool = True,
+    keep_browser_open: bool = False,
+    headless: bool = False,
+    disable_security: bool = True,
+    window_w: int = 1920,
+    window_h: int = 1080,
+    save_recording_path: str = "recordings",
+    save_agent_history_path: str = "agent_history",
+    save_trace_path: str = "traces",
+    enable_recording: bool = True,
+    max_steps: int = 50,
+    use_vision: bool = False,
+    max_actions_per_step: int = 5,
+    tool_calling_method: str = "function_calling"
+) -> tuple:
     """Generate test code using the AI agent"""
     try:
         # Extract URL from task description
@@ -57,12 +78,26 @@ async def generate_test(task_description: str, llm_provider: str, llm_model_name
             )
         url = url_match.group(0)
         
-        # Initialize test agent
+        # Initialize test agent with all browser settings
         agent = AITestAgent(
             llm_provider=llm_provider,
             llm_model_name=llm_model_name,
             llm_api_key=llm_api_key,
-            llm_base_url=llm_base_url
+            llm_base_url=llm_base_url,
+            use_own_browser=use_own_browser,
+            keep_browser_open=keep_browser_open,
+            headless=headless,
+            disable_security=disable_security,
+            window_w=window_w,
+            window_h=window_h,
+            save_recording_path=save_recording_path,
+            save_agent_history_path=save_agent_history_path,
+            save_trace_path=save_trace_path,
+            enable_recording=enable_recording,
+            max_steps=max_steps,
+            use_vision=use_vision,
+            max_actions_per_step=max_actions_per_step,
+            tool_calling_method=tool_calling_method
         )
         
         # Set task and analyze page
@@ -135,14 +170,50 @@ async def generate_test(task_description: str, llm_provider: str, llm_model_name
             f"Error: {str(e)}"  # generation_logs
         )
 
-async def execute_test(test_code: str, llm_provider: str, llm_model_name: str, llm_api_key: str, llm_base_url: str):
+async def execute_test(
+    test_code: str, 
+    llm_provider: str, 
+    llm_model_name: str, 
+    llm_api_key: str, 
+    llm_base_url: str,
+    # Browser settings
+    use_own_browser: bool = True,
+    keep_browser_open: bool = False,
+    headless: bool = False,
+    disable_security: bool = True,
+    window_w: int = 1920,
+    window_h: int = 1080,
+    save_recording_path: str = "recordings",
+    save_agent_history_path: str = "agent_history",
+    save_trace_path: str = "traces",
+    enable_recording: bool = True,
+    max_steps: int = 50,
+    use_vision: bool = False,
+    max_actions_per_step: int = 5,
+    tool_calling_method: str = "function_calling"
+):
     """Execute generated test code"""
     try:
+        # Initialize test agent with all browser settings
         agent = AITestAgent(
             llm_provider=llm_provider,
             llm_model_name=llm_model_name,
             llm_api_key=llm_api_key,
-            llm_base_url=llm_base_url
+            llm_base_url=llm_base_url,
+            use_own_browser=use_own_browser,
+            keep_browser_open=keep_browser_open,
+            headless=headless,
+            disable_security=disable_security,
+            window_w=window_w,
+            window_h=window_h,
+            save_recording_path=save_recording_path,
+            save_agent_history_path=save_agent_history_path,
+            save_trace_path=save_trace_path,
+            enable_recording=enable_recording,
+            max_steps=max_steps,
+            use_vision=use_vision,
+            max_actions_per_step=max_actions_per_step,
+            tool_calling_method=tool_calling_method
         )
         
         # Initial state
@@ -1698,13 +1769,53 @@ def create_ui():
 
         generate_button.click(
             fn=generate_test,
-            inputs=[task_input, llm_provider, llm_model_name, llm_api_key, llm_base_url],
+            inputs=[
+                task_input, 
+                llm_provider, 
+                llm_model_name, 
+                llm_api_key, 
+                llm_base_url,
+                use_own_browser,
+                keep_browser_open,
+                headless,
+                disable_security,
+                window_w,
+                window_h,
+                save_recording_path,
+                save_agent_history_path,
+                save_trace_path,
+                enable_recording,
+                max_steps,
+                use_vision,
+                max_actions_per_step,
+                tool_calling_method
+            ],
             outputs=[test_code, error_output, execute_button, video_output, video_file, generation_logs]
         )
         
         execute_button.click(
             fn=execute_test,
-            inputs=[test_code, llm_provider, llm_model_name, llm_api_key, llm_base_url],
+            inputs=[
+                test_code, 
+                llm_provider, 
+                llm_model_name, 
+                llm_api_key, 
+                llm_base_url,
+                use_own_browser,
+                keep_browser_open,
+                headless,
+                disable_security,
+                window_w,
+                window_h,
+                save_recording_path,
+                save_agent_history_path,
+                save_trace_path,
+                enable_recording,
+                max_steps,
+                use_vision,
+                max_actions_per_step,
+                tool_calling_method
+            ],
             outputs=[error_output, screenshot_output, video_output, video_file, execution_logs]
         )
         

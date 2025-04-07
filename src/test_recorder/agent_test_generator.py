@@ -23,7 +23,26 @@ logger = logging.getLogger(__name__)
 class AITestAgent:
     """Agent that generates and executes Playwright tests using best practices"""
     
-    def __init__(self, llm_provider: str = "mistral", llm_model_name: str = "", llm_api_key: str = "", llm_base_url: str = ""):
+    def __init__(self, 
+                 llm_provider: str = "mistral", 
+                 llm_model_name: str = "", 
+                 llm_api_key: str = "", 
+                 llm_base_url: str = "",
+                 # Browser settings
+                 use_own_browser: bool = True,
+                 keep_browser_open: bool = False,
+                 headless: bool = False,
+                 disable_security: bool = True,
+                 window_w: int = 1920,
+                 window_h: int = 1080,
+                 save_recording_path: str = "recordings",
+                 save_agent_history_path: str = "agent_history",
+                 save_trace_path: str = "traces",
+                 enable_recording: bool = True,
+                 max_steps: int = 50,
+                 use_vision: bool = False,
+                 max_actions_per_step: int = 5,
+                 tool_calling_method: str = "function_calling"):
         self.task_description = ""
         self.page_analysis = None
         self.llm = utils.get_llm_model(
@@ -34,6 +53,22 @@ class AITestAgent:
             temperature=0.0
         )
         self.logs = []
+        
+        # Store browser settings
+        self.use_own_browser = use_own_browser
+        self.keep_browser_open = keep_browser_open
+        self.headless = headless
+        self.disable_security = disable_security
+        self.window_w = window_w
+        self.window_h = window_h
+        self.save_recording_path = save_recording_path
+        self.save_agent_history_path = save_agent_history_path
+        self.save_trace_path = save_trace_path
+        self.enable_recording = enable_recording
+        self.max_steps = max_steps
+        self.use_vision = use_vision
+        self.max_actions_per_step = max_actions_per_step
+        self.tool_calling_method = tool_calling_method
     
     def log(self, message: str):
         """Add a log message with timestamp"""
@@ -101,8 +136,31 @@ class AITestAgent:
         
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=False)
-                page = await browser.new_page()
+                # Configure browser with settings
+                extra_args = [f"--window-size={self.window_w},{self.window_h}"]
+                if self.use_own_browser:
+                    chrome_path = os.getenv("CHROME_PATH", None)
+                    if chrome_path == "":
+                        chrome_path = None
+                    chrome_user_data = os.getenv("CHROME_USER_DATA", None)
+                    if chrome_user_data:
+                        extra_args += [f"--user-data-dir={chrome_user_data}"]
+                else:
+                    chrome_path = None
+
+                browser = await p.chromium.launch(
+                    headless=self.headless,
+                    channel="chrome",
+                    args=extra_args,
+                    executable_path=chrome_path if self.use_own_browser else None
+                )
+
+                # Configure browser context
+                context = await browser.new_context(
+                    viewport={"width": self.window_w, "height": self.window_h},
+                    record_video_dir=self.save_recording_path if self.enable_recording else None
+                )
+                page = await context.new_page()
                 await page.goto(url)
                 await page.wait_for_load_state("networkidle")
                 
@@ -214,8 +272,31 @@ class AITestAgent:
         
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=False)
-                page = await browser.new_page()
+                # Configure browser with settings
+                extra_args = [f"--window-size={self.window_w},{self.window_h}"]
+                if self.use_own_browser:
+                    chrome_path = os.getenv("CHROME_PATH", None)
+                    if chrome_path == "":
+                        chrome_path = None
+                    chrome_user_data = os.getenv("CHROME_USER_DATA", None)
+                    if chrome_user_data:
+                        extra_args += [f"--user-data-dir={chrome_user_data}"]
+                else:
+                    chrome_path = None
+
+                browser = await p.chromium.launch(
+                    headless=self.headless,
+                    channel="chrome",
+                    args=extra_args,
+                    executable_path=chrome_path
+                )
+
+                # Configure browser context
+                context = await browser.new_context(
+                    viewport={"width": self.window_w, "height": self.window_h},
+                    record_video_dir=self.save_recording_path if self.enable_recording else None
+                )
+                page = await context.new_page()
                 
                 # Extract URL from task description
                 import re
@@ -320,10 +401,10 @@ class AITestAgent:
         try:
             # Create temporary test directory for pytest
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Create conftest.py with basic configuration
+                # Create conftest.py with browser settings
                 conftest_path = os.path.join(temp_dir, "conftest.py")
                 with open(conftest_path, "w") as f:
-                    f.write("""
+                    f.write(f"""
 import pytest
 import os
 import time
@@ -332,7 +413,7 @@ from playwright.sync_api import Page, Browser, BrowserContext, expect
 
 def take_screenshot(page: Page, name: str) -> None:
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    screenshots_dir = "{}"
+    screenshots_dir = "{screenshots_dir}"
     os.makedirs(screenshots_dir, exist_ok=True)
     screenshot_path = os.path.join(screenshots_dir, f"{{name}}_{{timestamp}}.png")
     try:
@@ -343,7 +424,11 @@ def take_screenshot(page: Page, name: str) -> None:
 
 @pytest.fixture(scope="function")
 def page(browser: Browser, request) -> Generator[Page, None, None]:
-    context = browser.new_context(viewport={{"width": 1280, "height": 720}})
+    # Configure browser context with settings
+    context = browser.new_context(
+        viewport={{"width": {self.window_w}, "height": {self.window_h}}},
+        record_video_dir="{self.save_recording_path}" if {self.enable_recording} else None
+    )
     page = context.new_page()
     test_name = request.node.name
     
@@ -371,7 +456,7 @@ def pytest_runtest_makereport(item, call):
     outcome = yield
     rep = outcome.get_result()
     setattr(item, "rep_" + rep.when, rep)
-""".format(screenshots_dir))
+""")
                 
                 # Create test file
                 test_path = os.path.join(temp_dir, "test_generated.py")
@@ -392,27 +477,41 @@ def pytest_runtest_makereport(item, call):
                     )
                     self.log("  ✅ Packages installed")
                     
-                    subprocess.run(
-                        ["playwright", "install", "--with-deps", "chromium"],
-                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                    )
-                    self.log("  ✅ Browser installed")
+                    # Install Chrome browser if not using system Chrome
+                    if not self.use_own_browser:
+                        subprocess.run(
+                            ["playwright", "install", "--with-deps", "chrome"],
+                            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                        )
+                        self.log("  ✅ Browser installed")
                     
-                    # Run test
+                    # Run test with browser settings
                     self.log("\n2️⃣ Executing test...")
                     start_time = time.time()
                     
+                    # Build pytest command with browser settings
+                    pytest_cmd = [
+                        "pytest", "-v",
+                        "--headed" if not self.headless else "",
+                        "--browser", "chromium",
+                        "--browser-channel", "chrome",
+                        test_path
+                    ]
+                    
+                    # Set environment variables for browser settings
+                    env = os.environ.copy()
+                    if self.use_own_browser:
+                        chrome_path = os.getenv("CHROME_PATH", None)
+                        if chrome_path:
+                            env["PLAYWRIGHT_CHROMIUM_PATH"] = chrome_path
+                    
                     result = subprocess.run(
-                        [
-                            "pytest", "-v",
-                            "--headed",  # Run in headed mode
-                            "--browser", "chromium",
-                            test_path
-                        ],
+                        [cmd for cmd in pytest_cmd if cmd],  # Remove empty strings
                         capture_output=True,
                         text=True,
                         timeout=120,
-                        cwd=temp_dir
+                        cwd=temp_dir,
+                        env=env
                     )
                     
                     duration = time.time() - start_time
