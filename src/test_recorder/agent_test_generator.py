@@ -5,10 +5,13 @@ import logging
 import subprocess
 import tempfile
 import time
+import json
 from typing import Dict, Any, Optional, Tuple, cast, Union, List, Mapping
 from langchain.schema import HumanMessage
 from pydantic import SecretStr
 from src.utils import utils
+from playwright.async_api import Page
+from playwright.sync_api import expect
 
 # Set up logging
 logging.basicConfig(
@@ -20,13 +23,14 @@ logger = logging.getLogger(__name__)
 class AITestAgent:
     """Agent that generates and executes Playwright tests using best practices"""
     
-    def __init__(self, llm_provider: str = "openai", llm_model_name: str = None, llm_api_key: str = None, llm_base_url: str = None):
+    def __init__(self, llm_provider: str = "mistral", llm_model_name: str = "", llm_api_key: str = "", llm_base_url: str = ""):
         self.task_description = ""
+        self.page_analysis = None
         self.llm = utils.get_llm_model(
             provider=llm_provider,
-            model_name=llm_model_name,
-            api_key=llm_api_key,
-            base_url=llm_base_url,
+            model_name=llm_model_name or "mistral-large-latest",  # Default model
+            api_key=llm_api_key or os.getenv("MISTRAL_API_KEY", ""),  # Get from env if not provided
+            base_url=llm_base_url or "",  # Empty string if not provided
             temperature=0.0
         )
         self.logs = []
@@ -89,132 +93,209 @@ class AITestAgent:
             self.log(f"Error: {error_msg}")
             return False, error_msg, media_paths
     
+    async def analyze_page(self, url: str) -> Dict[str, Any]:
+        """Analyze the page structure using LLM."""
+        self.log("\n🔍 Analyzing page structure...")
+        
+        from playwright.async_api import async_playwright
+        
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=False)
+                page = await browser.new_page()
+                await page.goto(url)
+                await page.wait_for_load_state("networkidle")
+                
+                # Get page content and metadata
+                title = await page.title()
+                content = await page.content()
+                
+                # Ask LLM to analyze the page structure
+                prompt = f"""
+                Analyze this HTML page structure and identify key interactive elements and their properties.
+                Focus on elements that would be important for testing.
+                
+                Page Title: {title}
+                URL: {url}
+                
+                HTML Content:
+                {content}
+                
+                Please analyze and return a JSON structure with:
+                1. Page metadata (title, h1 headings)
+                2. Interactive elements (buttons, inputs, links, etc.)
+                3. Important structural elements
+                4. Best selectors to use for each element
+                5. Suggested test interactions
+                
+                Return ONLY valid JSON without any other text.
+                The JSON should follow this exact structure:
+                {{
+                    "title": "page title",
+                    "elements": [
+                        {{
+                            "type": "element type",
+                            "selector": "best selector",
+                            "text": "element text or value",
+                            "interactions": ["list", "of", "possible", "interactions"]
+                        }}
+                    ],
+                    "structure": [
+                        {{
+                            "type": "structural element",
+                            "selector": "selector path"
+                        }}
+                    ],
+                    "suggested_tests": [
+                        "list of suggested test cases"
+                    ]
+                }}
+                """
+                
+                response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+                try:
+                    analysis = json.loads(cast(str, response.content))
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try to extract JSON from the response
+                    content = cast(str, response.content)
+                    json_start = content.find('{')
+                    json_end = content.rfind('}') + 1
+                    if json_start >= 0 and json_end > json_start:
+                        try:
+                            analysis = json.loads(content[json_start:json_end])
+                        except json.JSONDecodeError:
+                            # If still fails, return a basic structure
+                            analysis = {
+                                "title": title,
+                                "elements": [],
+                                "structure": [],
+                                "suggested_tests": []
+                            }
+                    else:
+                        # If no JSON found, return basic structure
+                        analysis = {
+                            "title": title,
+                            "elements": [],
+                            "structure": [],
+                            "suggested_tests": []
+                        }
+                
+                self.page_analysis = analysis
+                
+                # Log summary
+                self.log("\n📋 Page Analysis Summary:")
+                self.log(f"Title: {analysis.get('title', 'N/A')}")
+                self.log(f"Elements found: {len(analysis.get('elements', []))}")
+                
+                await browser.close()
+                return analysis
+                
+        except Exception as e:
+            error = f"Error analyzing page: {str(e)}"
+            self.log(f"\n❌ {error}")
+            # Return basic structure even on error
+            return {
+                "title": "Error",
+                "elements": [],
+                "structure": [],
+                "suggested_tests": []
+            }
+            
     async def generate_test_code(self, error_message: Optional[str] = None) -> Union[str, Tuple[str, Mapping[str, Union[str, List[str]]]]]:
-        """Generate test code using LLM"""
+        """Generate test code using LLM with page analysis"""
         self.log("\n🎯 Starting test generation process...")
         self.log(f"📝 Task: {self.task_description}")
         
-        media_paths: Dict[str, Union[str, List[str]]] = {
-            "screenshots": [],
-            "videos": [],
-            "generation_video": "",
-            "execution_video": ""
-        }
-        
         if error_message:
-            self.log("\n🔄 Previous error detected - adjusting generation strategy")
-            self.log(f"Previous error: {error_message}")
+            self.log(f"⚠️ Previous attempt failed: {error_message}")
         
-        self.log("\n1️⃣ Generating test code...")
-        page_context = """
-        Generate a robust Playwright test following these patterns and requirements:
-
-        1. Page Object Model Structure:
-           - Create a Page class that encapsulates all page interactions
-           - Use meaningful method names that describe the action being performed
-           - Each method should handle one specific action
-           - Include proper validation after each action
-           - Use strong typing with Page parameter
-
-        2. Locator Patterns:
-           - Use data-testid attributes when available
-           - Use role-based selectors (getByRole) when appropriate
-           - Use text-based selectors as fallback
-           - Use class selectors only when necessary
-           - Use meaningful locator names
-
-        3. Action Patterns:
-           - Before any action: expect(element).to_be_visible(timeout=5000)
-           - After input: expect(element).to_have_value(expected_value, timeout=5000)
-           - After state changes: expect(element).to_have_class(expected_class, timeout=5000)
-           - After count changes: expect(count_element).to_contain_text(str(expected_count), timeout=5000)
-           - After any change: expect(element).to_be_visible(timeout=5000)
-
-        4. Test Structure:
-           - Use pytest fixtures for setup
-           - Implement proper error handling with try/except
-           - Take screenshots on failure
-           - Use meaningful test names
-           - Group related actions together
-           - Add comments explaining test flow
-
-        5. Required Validations:
-           - Verify element state after interactions
-           - Verify text content after changes
-           - Verify element attributes after updates
-           - Verify counts after list changes
-           - Verify form field states after submission
-
-        6. Error Handling:
-           - Catch and log exceptions
-           - Take screenshots on failure
-           - Use proper cleanup in finally blocks
-           - Add timeouts to all expect calls
-           - Handle page load states
-
-        The test must implement all these patterns while completing the task.
-        Focus on reliability and proper validation of each step.
-        """
+        # Get page content for analysis
+        from playwright.async_api import async_playwright
         
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            self.log(f"\n📝 Generating test code (attempt {attempt + 1}/{max_attempts})...")
-            response = await self.llm.ainvoke([HumanMessage(content=f"""
-            Task: Create a Playwright test that will:
-            {self.task_description}
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=False)
+                page = await browser.new_page()
+                
+                # Extract URL from task description
+                import re
+                url_match = re.search(r'Navigate to (https?://[^\s,]+)', self.task_description)
+                if not url_match:
+                    raise ValueError("No URL found in task description. Task must start with 'Navigate to <url>'")
+                    
+                url = url_match.group(1)
+                await page.goto(url)
+                await page.wait_for_load_state("networkidle")
+                
+                title = await page.title()
+                content = await page.content()
+                await browser.close()
+                
+                # Build comprehensive prompt with page analysis and error feedback
+                prompt = f"""
+                Task: Create a Playwright test that will:
+                {self.task_description}
 
-            Requirements and Patterns:
-            {page_context}
+                Page Information:
+                URL: {url}
+                Title: {title}
+                
+                HTML Content for Analysis:
+                {content}
+                
+                {"IMPORTANT - Previous test failed with error:" + error_message if error_message else ""}
+                {"Please ensure the test handles these issues and uses correct selectors." if error_message else ""}
 
-            Previous error (if any): {error_message if error_message else 'None'}
+                Requirements:
+                1. Analyze the HTML content and identify:
+                   - Key interactive elements and their best selectors
+                   - Important structural elements
+                   - Best practices for element selection
+                   - Potential stability issues to handle
 
-            Important Notes:
-            1. Return ONLY the complete Python test code without any explanations or markdown
-            2. The code must be immediately runnable with pytest
-            3. Include ALL necessary imports
-            4. Follow ALL the patterns exactly as specified
-            5. Implement proper validation after EVERY action
-            6. Use the EXACT selectors provided in the patterns
-            7. Add appropriate timeouts to ALL expect calls
-            8. Handle ALL possible errors
-            9. Take screenshots at key points
-            10. Use meaningful names and comments
+                2. Generate a complete test using:
+                   - Page Object Model pattern
+                   - Reliable selector strategies (data-testid > role > text > class)
+                   - Proper waiting after each action
+                   - Clear assertions with stable selectors
+                   - Error handling for element state
 
-            Generate the complete test code now.
-            """)])
-            
-            test_code = self._extract_code_from_response(cast(str, response.content))
-            
-            # Log the generated code
-            self.log("\n📋 Generated test code:")
-            self.log("```python")
-            self.log(test_code)
-            self.log("```")
-            
-            # Run dynamic verification
-            self.log("\n🚀 Running test for verification...")
-            success, error_msg, execution_media = await self.execute_test(test_code)
-            
-            # Merge media paths
-            media_paths = {
-                **media_paths,
-                **execution_media
-            }
-            
-            if success:
-                self.log("✅ Test passed verification!")
-                return test_code, media_paths
-            else:
-                self.log("❌ Test failed verification")
-                self.log(f"Error: {error_msg}")
-                if attempt < max_attempts - 1:
-                    error_message = error_msg
-                    continue
+                3. Follow these patterns:
+                   - Use pytest fixtures
+                   - Wait for elements to be ready before interacting
+                   - Validate element state after each action
+                   - Handle loading and transition states
+                   - Use semantic method names
+                   - Add appropriate timeouts to assertions
+
+                Return ONLY the complete Python test code without any explanations or markdown.
+                The code must be immediately runnable with pytest.
+                """
+
+                response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+                test_code = self._extract_code_from_response(cast(str, response.content))
+                
+                # Log the generated code
+                self.log("\n📋 Generated test code:")
+                self.log("```python")
+                self.log(test_code)
+                self.log("```")
+                
+                # Run verification
+                success, error_msg, execution_media = await self.execute_test(test_code)
+                
+                if success:
+                    self.log("✅ Test passed verification!")
+                    return test_code, execution_media
                 else:
-                    self.log("\n💥 Failed to generate working test after max attempts")
-                    raise Exception(f"Failed to generate working test after {max_attempts} attempts. Last error: {error_msg}")
-        
-        raise Exception("Failed to generate valid test code after max attempts")
+                    self.log("❌ Test failed verification")
+                    self.log(f"Error: {error_msg}")
+                    raise Exception(error_msg)
+                    
+        except Exception as e:
+            error = f"Error generating test: {str(e)}"
+            self.log(f"\n❌ {error}")
+            raise Exception(error)
     
     async def execute_test(self, test_code: str) -> Tuple[bool, str, Dict[str, Union[str, List[str]]]]:
         """Execute the test code and return success status, error message, and media paths"""
@@ -224,10 +305,9 @@ class AITestAgent:
         base_dir = os.path.join(os.getcwd(), "test_artifacts")
         run_dir = os.path.join(base_dir, timestamp)
         screenshots_dir = os.path.join(run_dir, "screenshots")
-        videos_dir = os.path.join(run_dir, "videos")
         
-        # Create all directories
-        for directory in [base_dir, run_dir, screenshots_dir, videos_dir]:
+        # Create directories
+        for directory in [base_dir, run_dir, screenshots_dir]:
             os.makedirs(directory, exist_ok=True)
             
         media_paths: Dict[str, Union[str, List[str]]] = {
@@ -240,10 +320,10 @@ class AITestAgent:
         try:
             # Create temporary test directory for pytest
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Create conftest.py with video recording configuration
+                # Create conftest.py with basic configuration
                 conftest_path = os.path.join(temp_dir, "conftest.py")
                 with open(conftest_path, "w") as f:
-                    f.write(f"""
+                    f.write("""
 import pytest
 import os
 import time
@@ -252,34 +332,18 @@ from playwright.sync_api import Page, Browser, BrowserContext, expect
 
 def take_screenshot(page: Page, name: str) -> None:
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    screenshots_dir = "{screenshots_dir}"
+    screenshots_dir = "{}"
     os.makedirs(screenshots_dir, exist_ok=True)
     screenshot_path = os.path.join(screenshots_dir, f"{{name}}_{{timestamp}}.png")
     try:
         page.screenshot(path=screenshot_path)
-        print(f"\\n📸 Screenshot saved to: {{screenshot_path}}")
+        print(f"\\n📸 Screenshot saved: {{screenshot_path}}")
     except Exception as e:
         print(f"\\n⚠️ Failed to take screenshot: {{e}}")
 
-@pytest.fixture(scope="session")
-def browser_context_args(browser_context_args):
-    return {{
-        **browser_context_args,
-        "viewport": {{"width": 1280, "height": 720}},
-        "record_video_dir": "{videos_dir}"
-    }}
-
 @pytest.fixture(scope="function")
-def context(browser: Browser) -> Generator[BrowserContext, None, None]:
-    context = browser.new_context(
-        record_video_size={{"width": 1280, "height": 720}},
-        viewport={{"width": 1280, "height": 720}}
-    )
-    yield context
-    context.close()
-
-@pytest.fixture(scope="function")
-def page(context: BrowserContext, request) -> Generator[Page, None, None]:
+def page(browser: Browser, request) -> Generator[Page, None, None]:
+    context = browser.new_context(viewport={{"width": 1280, "height": 720}})
     page = context.new_page()
     test_name = request.node.name
     
@@ -300,13 +364,14 @@ def page(context: BrowserContext, request) -> Generator[Page, None, None]:
                 take_screenshot(page, f"{{test_name}}_success")
     finally:
         page.close()
+        context.close()
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
     rep = outcome.get_result()
     setattr(item, "rep_" + rep.when, rep)
-""")
+""".format(screenshots_dir))
                 
                 # Create test file
                 test_path = os.path.join(temp_dir, "test_generated.py")
@@ -317,7 +382,7 @@ def pytest_runtest_makereport(item, call):
                 with open(test_path, "w") as f:
                     f.write(enhanced_test_code)
                 
-                self.log("📄 Created test files with enhanced recording configuration")
+                self.log("📄 Created test files with basic configuration")
                 
                 try:
                     # Install dependencies
@@ -333,8 +398,8 @@ def pytest_runtest_makereport(item, call):
                     )
                     self.log("  ✅ Browser installed")
                     
-                    # Run test with video recording
-                    self.log("\n2️⃣ Executing test with video recording...")
+                    # Run test
+                    self.log("\n2️⃣ Executing test...")
                     start_time = time.time()
                     
                     result = subprocess.run(
@@ -342,9 +407,6 @@ def pytest_runtest_makereport(item, call):
                             "pytest", "-v",
                             "--headed",  # Run in headed mode
                             "--browser", "chromium",
-                            "--video=on",  # Enable video recording
-                            "--screenshot=on",  # Enable screenshots
-                            "--tracing=on",  # Enable tracing
                             test_path
                         ],
                         capture_output=True,
@@ -355,7 +417,7 @@ def pytest_runtest_makereport(item, call):
                     
                     duration = time.time() - start_time
                     
-                    # Collect media files
+                    # Collect screenshots
                     if os.path.exists(screenshots_dir):
                         screenshots = [
                             os.path.join(screenshots_dir, f) 
@@ -363,27 +425,12 @@ def pytest_runtest_makereport(item, call):
                             if f.endswith('.png')
                         ]
                         media_paths["screenshots"] = screenshots
-                        
-                    if os.path.exists(videos_dir):
-                        videos = [
-                            os.path.join(videos_dir, f)
-                            for f in os.listdir(videos_dir)
-                            if f.endswith('.webm')
-                        ]
-                        media_paths["videos"] = videos
-                        if videos:
-                            media_paths["execution_video"] = videos[-1]  # Latest video
                     
-                    # Log captured media
+                    # Log captured screenshots
                     if media_paths["screenshots"]:
                         self.log("\n📸 Screenshots captured:")
                         for screenshot in media_paths["screenshots"]:
                             self.log(f"  - {screenshot}")
-                    
-                    if media_paths["videos"]:
-                        self.log("\n🎥 Videos captured:")
-                        for video in media_paths["videos"]:
-                            self.log(f"  - {video}")
                     
                     if result.returncode == 0:
                         self.log(f"\n✅ Test passed! ({duration:.1f}s)")
@@ -480,7 +527,7 @@ def pytest_runtest_makereport(item, call):
         self.log("\n📋 Analysis complete")
         return analysis
     
-    async def run_with_retry(self, max_attempts: int = 3) -> Tuple[bool, Mapping[str, Union[str, List[str]]]]:
+    async def run_with_retry(self, max_attempts: int = 3) -> Tuple[bool, str, Mapping[str, Union[str, List[str]]]]:
         """Generate and run test with retry logic"""
         error_message: Optional[str] = None
         media_paths: Dict[str, Union[str, List[str]]] = {
@@ -489,6 +536,7 @@ def pytest_runtest_makereport(item, call):
             "generation_video": "",
             "execution_video": ""
         }
+        test_code = ""
         
         for attempt in range(max_attempts):
             self.log(f"\n🔄 Test attempt {attempt + 1}/{max_attempts}")
@@ -510,7 +558,7 @@ def pytest_runtest_makereport(item, call):
                     self.log("🎉 Test passed successfully!")
                     # Merge media paths from generation and execution
                     media_paths.update(execution_media)
-                    return True, media_paths
+                    return True, test_code, media_paths
                 
                 # If test failed and we have more attempts
                 if attempt < max_attempts - 1:
@@ -522,7 +570,7 @@ def pytest_runtest_makereport(item, call):
                         error_message = "Test failed without a specific error message. Will try to improve test reliability."
                 else:
                     self.log("❌ All retry attempts exhausted")
-                    return False, media_paths
+                    return False, test_code, media_paths
                     
             except Exception as e:
                 self.log(f"❌ Error during attempt {attempt + 1}: {str(e)}")
@@ -531,9 +579,9 @@ def pytest_runtest_makereport(item, call):
                     continue
                 else:
                     self.log("❌ All retry attempts exhausted")
-                    return False, media_paths
+                    return False, test_code, media_paths
         
-        return False, media_paths
+        return False, test_code, media_paths
     
     def _extract_code_from_response(self, content: str) -> str:
         """Extract code from API response"""
@@ -568,7 +616,6 @@ def pytest_runtest_makereport(item, call):
             logger.error(f"Response: {content}")
             raise Exception("Failed to extract code from API response")
 
-
 async def main():
     """Main function to run the AI test agent"""
     task_description = """Navigate to https://demo.playwright.dev/todomvc/, then:
@@ -582,7 +629,7 @@ async def main():
     agent = AITestAgent()
     agent.set_task(task_description)
     
-    success, media_paths = await agent.run_with_retry(max_attempts=3)
+    success, test_code, media_paths = await agent.run_with_retry(max_attempts=3)
     
     if success:
         logger.info("Test generated and executed successfully!")

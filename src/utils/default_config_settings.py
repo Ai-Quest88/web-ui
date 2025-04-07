@@ -12,8 +12,8 @@ def default_config():
         "max_actions_per_step": 10,
         "use_vision": True,
         "tool_calling_method": "auto",
-        "llm_provider": "openai",
-        "llm_model_name": "gpt-4o",
+        "llm_provider": "mistral",
+        "llm_model_name": "mistral-large-latest",
         "llm_num_ctx": 32000,
         "llm_temperature": 1.0,
         "llm_base_url": "",
@@ -36,12 +36,37 @@ def default_config():
     }
 
 
-def load_config_from_file(config_file):
+def load_config_from_file(provider=None):
     """Load settings from a UUID.pkl file."""
     try:
-        with open(config_file, 'rb') as f:
-            settings = pickle.load(f)
-        return settings
+        # Use default config if no provider is specified
+        config = default_config()
+        if provider:
+            config["llm_provider"] = provider
+        return (
+            config["agent_type"],
+            config["max_steps"],
+            config["max_actions_per_step"],
+            config["use_vision"],
+            config["tool_calling_method"],
+            config["llm_provider"],
+            config["llm_model_name"],
+            config["llm_num_ctx"],
+            config["llm_temperature"],
+            config["llm_base_url"],
+            config["llm_api_key"],
+            config["use_own_browser"],
+            config["keep_browser_open"],
+            config["headless"],
+            config["disable_security"],
+            config["enable_recording"],
+            config["window_w"],
+            config["window_h"],
+            config["save_recording_path"],
+            config["save_trace_path"],
+            config["save_agent_history_path"],
+            config["task"]
+        )
     except Exception as e:
         return f"Error loading configuration: {str(e)}"
 
@@ -83,47 +108,32 @@ def save_current_config(*args):
     return save_config_to_file(current_config)
 
 
-def update_ui_from_config(config_file):
-    if config_file is not None:
-        loaded_config = load_config_from_file(config_file.name)
-        if isinstance(loaded_config, dict):
-            return (
-                gr.update(value=loaded_config.get("agent_type", "custom")),
-                gr.update(value=loaded_config.get("max_steps", 100)),
-                gr.update(value=loaded_config.get("max_actions_per_step", 10)),
-                gr.update(value=loaded_config.get("use_vision", True)),
-                gr.update(value=loaded_config.get("tool_calling_method", True)),
-                gr.update(value=loaded_config.get("llm_provider", "openai")),
-                gr.update(value=loaded_config.get("llm_model_name", "gpt-4o")),
-                gr.update(value=loaded_config.get("llm_num_ctx", 32000)),
-                gr.update(value=loaded_config.get("llm_temperature", 1.0)),
-                gr.update(value=loaded_config.get("llm_base_url", "")),
-                gr.update(value=loaded_config.get("llm_api_key", "")),
-                gr.update(value=loaded_config.get("use_own_browser", False)),
-                gr.update(value=loaded_config.get("keep_browser_open", False)),
-                gr.update(value=loaded_config.get("headless", False)),
-                gr.update(value=loaded_config.get("disable_security", True)),
-                gr.update(value=loaded_config.get("enable_recording", True)),
-                gr.update(value=loaded_config.get("window_w", 1280)),
-                gr.update(value=loaded_config.get("window_h", 1100)),
-                gr.update(value=loaded_config.get("save_recording_path", "./tmp/record_videos")),
-                gr.update(value=loaded_config.get("save_trace_path", "./tmp/traces")),
-                gr.update(value=loaded_config.get("save_agent_history_path", "./tmp/agent_history")),
-                gr.update(value=loaded_config.get("task", "")),
-                "Configuration loaded successfully."
-            )
-        else:
-            return (
-                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-                gr.update(), "Error: Invalid configuration file."
-            )
+def update_ui_from_config(provider=None):
+    """Update UI with default config values."""
+    config = default_config()
+    if provider:
+        config["llm_provider"] = provider
     return (
-        gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-        gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-        gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-        gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-        gr.update(), "No file selected."
+        gr.update(value=config["agent_type"]),
+        gr.update(value=config["max_steps"]),
+        gr.update(value=config["max_actions_per_step"]),
+        gr.update(value=config["use_vision"]),
+        gr.update(value=config["tool_calling_method"]),
+        gr.update(value=config["llm_provider"]),
+        gr.update(value=config["llm_model_name"]),
+        gr.update(value=config["llm_num_ctx"]),
+        gr.update(value=config["llm_temperature"]),
+        gr.update(value=config["llm_base_url"]),
+        gr.update(value=config["llm_api_key"]),
+        gr.update(value=config["use_own_browser"]),
+        gr.update(value=config["keep_browser_open"]),
+        gr.update(value=config["headless"]),
+        gr.update(value=config["disable_security"]),
+        gr.update(value=config["enable_recording"]),
+        gr.update(value=config["window_w"]),
+        gr.update(value=config["window_h"]),
+        gr.update(value=config["save_recording_path"]),
+        gr.update(value=config["save_trace_path"]),
+        gr.update(value=config["save_agent_history_path"]),
+        gr.update(value=config["task"])
     )

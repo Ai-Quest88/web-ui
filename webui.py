@@ -4,6 +4,7 @@ import json
 import time
 import sys
 import subprocess
+import re
 
 from dotenv import load_dotenv
 
@@ -40,9 +41,23 @@ from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Sof
 from src.utils.default_config_settings import default_config, load_config_from_file, save_config_to_file, save_current_config, update_ui_from_config
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot
 
-async def generate_test(task_description: str, llm_provider: str, llm_model_name: str, llm_api_key: str, llm_base_url: str):
-    """Generate test code based on task description"""
+async def generate_test(task_description: str, llm_provider: str, llm_model_name: str, llm_api_key: str, llm_base_url: str = "") -> tuple:
+    """Generate test code using the AI agent"""
     try:
+        # Extract URL from task description
+        url_match = re.search(r'https?://[^\s,]+', task_description)
+        if not url_match:
+            return (
+                "",  # test_code
+                "Task description must contain a valid URL",  # error_output
+                gr.update(interactive=False),  # execute_button
+                None,  # video_output
+                None,  # video_file
+                "Error: Task description must contain a valid URL"  # generation_logs
+            )
+        url = url_match.group(0)
+        
+        # Initialize test agent
         agent = AITestAgent(
             llm_provider=llm_provider,
             llm_model_name=llm_model_name,
@@ -50,96 +65,74 @@ async def generate_test(task_description: str, llm_provider: str, llm_model_name
             llm_base_url=llm_base_url
         )
         
-        # Initial state
-        yield "", gr.update(visible=False), gr.update(interactive=False), gr.update(visible=False), gr.update(visible=False), "Starting test generation..."
-        
-        # Set task
-        agent.log("\n🎯 Starting test generation for task:")
-        agent.log(f"📝 {task_description}")
+        # Set task and analyze page
         agent.set_task(task_description)
-        yield "", gr.update(visible=False), gr.update(interactive=False), gr.update(visible=False), gr.update(visible=False), "\n".join(agent.logs)
+        try:
+            await agent.analyze_page(url)
+        except Exception as e:
+            return (
+                "",  # test_code
+                str(e),  # error_output
+                gr.update(interactive=False),  # execute_button
+                None,  # video_output
+                None,  # video_file
+                f"Error analyzing page: {str(e)}"  # generation_logs
+            )
         
-        # Generate and verify test code with retries
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                agent.log(f"\n📝 Attempt {attempt + 1}/{max_attempts} to generate working test...")
-                result = await agent.generate_test_code()
-                
-                # Handle tuple return value
-                if isinstance(result, tuple):
-                    test_code, gen_media_paths = result
-                else:
-                    test_code = result
-                    gen_media_paths = {}
-                
-                # Run test for verification
-                agent.log("\n🔍 Verifying generated test...")
-                success, error_msg, exec_media_paths = await agent.execute_test(test_code)
-                
-                # Get video if available
-                video_path = None
-                if exec_media_paths and "videos" in exec_media_paths and exec_media_paths["videos"]:
-                    video_path = exec_media_paths["videos"][-1]  # Get latest video
-                
-                if success:
-                    agent.log("\n✅ Test verification passed!")
-                    if video_path:
-                        agent.log(f"\n🎥 Test recording saved: {video_path}")
-                    yield (
-                        test_code,
-                        gr.update(visible=False),
-                        gr.update(interactive=True),
-                        gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),
-                        gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),
-                        "\n".join(agent.logs)
-                    )
-                    return
-                else:
-                    if attempt < max_attempts - 1:
-                        agent.log("\n🔄 Test failed verification - retrying with error feedback...")
-                        agent.log(f"Error: {error_msg}")
-                        continue
-                    else:
-                        agent.log("\n❌ Failed to generate working test after max attempts")
-                        error_msg = f"Failed to generate working test after {max_attempts} attempts"
-                        yield (
-                            "",
-                            gr.update(visible=True, value=error_msg),
-                            gr.update(interactive=False),
-                            gr.update(visible=False),
-                            gr.update(visible=False),
-                            "\n".join(agent.logs)
-                        )
-                        return
-                        
-            except Exception as e:
-                if attempt < max_attempts - 1:
-                    agent.log(f"\n⚠️ Error in attempt {attempt + 1}: {str(e)}")
-                    agent.log("🔄 Retrying...")
-                    continue
-                else:
-                    error_msg = f"Error during test generation: {str(e)}"
-                    agent.log(f"\n❌ {error_msg}")
-                    yield (
-                        "",
-                        gr.update(visible=True, value=error_msg),
-                        gr.update(interactive=False),
-                        gr.update(visible=False),
-                        gr.update(visible=False),
-                        "\n".join(agent.logs)
-                    )
-                    return
-        
+        # Generate and run test
+        try:
+            success, test_code, media_paths = await agent.run_with_retry()
+            if not success:
+                return (
+                    "",  # test_code
+                    "Failed to generate a passing test",  # error_output
+                    gr.update(interactive=False),  # execute_button
+                    None,  # video_output
+                    None,  # video_file
+                    "\n".join(agent.logs)  # generation_logs
+                )
+            
+            # Get latest video if available
+            video_path = None
+            if media_paths and "videos" in media_paths and media_paths["videos"]:
+                video_path = media_paths["videos"][-1]
+            
+            # Build logs output
+            logs = "\n".join([
+                "✅ Test generated successfully!",
+                "",
+                "📋 Test generation completed",
+                "",
+                "📝 Generated test code is ready to execute"
+            ])
+            
+            return (
+                test_code,  # test_code
+                "",  # error_output
+                gr.update(interactive=True),  # execute_button
+                video_path,  # video_output
+                video_path,  # video_file
+                logs  # generation_logs
+            )
+            
+        except Exception as e:
+            return (
+                "",  # test_code
+                str(e),  # error_output
+                gr.update(interactive=False),  # execute_button
+                None,  # video_output
+                None,  # video_file
+                f"Error generating test: {str(e)}\n\n" + "\n".join(agent.logs)  # generation_logs
+            )
+            
     except Exception as e:
-        error_msg = f"Error during test generation: {str(e)}"
-        yield (
-            "",
-            gr.update(visible=True, value=error_msg),
-            gr.update(interactive=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            error_msg
+        return (
+            "",  # test_code
+            str(e),  # error_output
+            gr.update(interactive=False),  # execute_button
+            None,  # video_output
+            None,  # video_file
+            f"Error: {str(e)}"  # generation_logs
         )
 
 async def execute_test(test_code: str, llm_provider: str, llm_model_name: str, llm_api_key: str, llm_base_url: str):
@@ -154,15 +147,14 @@ async def execute_test(test_code: str, llm_provider: str, llm_model_name: str, l
         
         # Initial state
         yield (
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            "Starting test execution..."
+            gr.update(visible=False),  # error_output
+            gr.update(visible=False),  # screenshot_output
+            gr.update(visible=False),  # video_output
+            gr.update(visible=False),  # video_file
+            "🚀 Starting test execution..."  # execution_logs
         )
         
         # Execute test
-        agent.log("\n🚀 Executing test...")
         success, error_msg, media_paths = await agent.execute_test(test_code)
         
         # Get screenshot and video if available
@@ -175,40 +167,52 @@ async def execute_test(test_code: str, llm_provider: str, llm_model_name: str, l
                 video_path = media_paths["videos"][-1]  # Get latest video
         
         if success:
-            agent.log("\n✅ Test executed successfully!")
-            if video_path:
-                agent.log(f"\n🎥 Test recording saved: {video_path}")
-            if screenshot_path:
-                agent.log(f"\n📸 Screenshot saved: {screenshot_path}")
+            logs = "\n".join([
+                "✅ Test executed successfully!",
+                "",
+                "📸 Screenshots:",
+                *[f"- {path}" for path in media_paths.get("screenshots", [])],
+                "",
+                "🎥 Videos:",
+                *[f"- {path}" for path in media_paths.get("videos", [])]
+            ])
+            
             yield (
-                gr.update(visible=False),
-                gr.update(visible=True, value=screenshot_path) if screenshot_path else gr.update(visible=False),
-                gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),
-                gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),
-                "\n".join(agent.logs)
+                gr.update(visible=False),  # error_output
+                gr.update(visible=True, value=screenshot_path) if screenshot_path else gr.update(visible=False),  # screenshot_output
+                gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),  # video_output
+                gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),  # video_file
+                logs  # execution_logs
             )
         else:
-            agent.log("\n❌ Test execution failed!")
-            if video_path:
-                agent.log(f"\n🎥 Failure recording saved: {video_path}")
-            if screenshot_path:
-                agent.log(f"\n📸 Failure screenshot saved: {screenshot_path}")
+            logs = "\n".join([
+                "❌ Test execution failed!",
+                "",
+                f"Error: {error_msg}",
+                "",
+                "📸 Failure Screenshots:",
+                *[f"- {path}" for path in media_paths.get("screenshots", [])],
+                "",
+                "🎥 Failure Videos:",
+                *[f"- {path}" for path in media_paths.get("videos", [])]
+            ])
+            
             yield (
-                gr.update(visible=True, value=error_msg),
-                gr.update(visible=True, value=screenshot_path) if screenshot_path else gr.update(visible=False),
-                gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),
-                gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),
-                "\n".join(agent.logs)
+                gr.update(visible=True, value=error_msg),  # error_output
+                gr.update(visible=True, value=screenshot_path) if screenshot_path else gr.update(visible=False),  # screenshot_output
+                gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),  # video_output
+                gr.update(visible=True, value=video_path) if video_path else gr.update(visible=False),  # video_file
+                logs  # execution_logs
             )
                 
     except Exception as e:
         error_msg = f"Error during test execution: {str(e)}"
         yield (
-            gr.update(visible=True, value=error_msg),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            error_msg
+            gr.update(visible=True, value=error_msg),  # error_output
+            gr.update(visible=False),  # screenshot_output
+            gr.update(visible=False),  # video_output
+            gr.update(visible=False),  # video_file
+            error_msg  # execution_logs
         )
 
 # Global variables for persistence
@@ -1087,10 +1091,198 @@ def create_ui():
     theme = Soft()
 
     # Create blocks
-    with gr.Blocks(theme=theme, title="Browser Use") as demo:
-        gr.Markdown("# Browser Use")
+    with gr.Blocks(theme=theme, title="TAAIF") as demo:
+        gr.Markdown("# TAAIF")
         
         with gr.Tabs() as tabs:
+            # Test Automator Tab
+            with gr.Tab("Test Automator", id="test_automator"):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        task_input = gr.Textbox(
+                            label="Test Description",
+                            placeholder="Describe the test scenario",
+                            lines=3,
+                            interactive=True
+                        )
+                        generate_button = gr.Button("Generate Test", variant="primary")
+                        test_code = gr.Code(
+                            label="Generated Test",
+                            language="python",
+                            interactive=False
+                        )
+                        execute_button = gr.Button("Execute Test", interactive=False)
+                        error_output = gr.Textbox(
+                            label="Error",
+                            visible=False,
+                            interactive=False
+                        )
+                    
+                    with gr.Column(scale=1):
+                        generation_logs = gr.Textbox(
+                            label="Generation Logs",
+                            lines=10,
+                            interactive=False
+                        )
+                        execution_logs = gr.Textbox(
+                            label="Execution Logs", 
+                            lines=10,
+                            interactive=False
+                        )
+                        screenshot_output = gr.Image(
+                            label="Screenshot",
+                            visible=False,
+                            interactive=False
+                        )
+                        video_output = gr.Video(
+                            label="Recording",
+                            visible=False,
+                            interactive=False
+                        )
+                        video_file = gr.File(
+                            label="Download Recording",
+                            visible=False,
+                            interactive=False
+                        )
+
+            # Settings Tab
+            with gr.Tab("Settings", id="settings"):
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### LLM Settings")
+                        llm_provider = gr.Dropdown(
+                            choices=[provider for provider, model in utils.model_names.items()],
+                            value="mistral",
+                            label="LLM Provider",
+                            info="Select your preferred language model provider",
+                            interactive=True
+                        )
+                        llm_model_name = gr.Dropdown(
+                            choices=utils.model_names[llm_provider.value],
+                            value=utils.model_names[llm_provider.value][0] if utils.model_names[llm_provider.value] else "",
+                            label="Model Name",
+                            info="Select a model from the dropdown or type a custom model name",
+                            interactive=True,
+                            allow_custom_value=True
+                        )
+                        llm_num_ctx = gr.Slider(
+                            minimum=1000,
+                            maximum=128000,
+                            value=4000,
+                            step=1000,
+                            label="Context Length",
+                            info="Maximum context length in tokens",
+                            interactive=True
+                        )
+                        llm_temperature = gr.Slider(
+                            minimum=0.0,
+                            maximum=2.0,
+                            value=0.0,
+                            step=0.1,
+                            label="Temperature",
+                            info="Controls randomness in the output (0.0 = deterministic, 2.0 = very random)",
+                            interactive=True
+                        )
+                        llm_base_url = gr.Textbox(
+                            value="",
+                            label="Base URL (optional)",
+                            info="Custom API endpoint URL (leave blank to use default)",
+                            interactive=True
+                        )
+                        llm_api_key = gr.Textbox(
+                            value="",
+                            label="API Key",
+                            type="password",
+                            info="Your API key (leave blank to use .env)",
+                            interactive=True
+                        )
+
+                    with gr.Column():
+                        gr.Markdown("### Browser Settings")
+                        use_own_browser = gr.Checkbox(
+                            value=False,
+                            label="Use Own Browser",
+                            interactive=True
+                        )
+                        keep_browser_open = gr.Checkbox(
+                            value=False,
+                            label="Keep Browser Open",
+                            interactive=True
+                        )
+                        headless = gr.Checkbox(
+                            value=False,
+                            label="Headless Mode",
+                            interactive=True
+                        )
+                        disable_security = gr.Checkbox(
+                            value=False,
+                            label="Disable Security",
+                            interactive=True
+                        )
+                        window_w = gr.Number(
+                            value=1280,
+                            label="Window Width",
+                            interactive=True
+                        )
+                        window_h = gr.Number(
+                            value=720,
+                            label="Window Height",
+                            interactive=True
+                        )
+
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### Recording Settings")
+                        save_recording_path = gr.Textbox(
+                            value="recordings",
+                            label="Recording Path",
+                            interactive=True
+                        )
+                        save_agent_history_path = gr.Textbox(
+                            value="agent_history",
+                            label="Agent History Path",
+                            interactive=True
+                        )
+                        save_trace_path = gr.Textbox(
+                            value="traces",
+                            label="Trace Path",
+                            interactive=True
+                        )
+                        enable_recording = gr.Checkbox(
+                            value=True,
+                            label="Enable Recording",
+                            interactive=True
+                        )
+
+                    with gr.Column():
+                        gr.Markdown("### Agent Settings")
+                        max_steps = gr.Number(
+                            value=50,
+                            label="Max Steps",
+                            interactive=True
+                        )
+                        use_vision = gr.Checkbox(
+                            value=False,
+                            label="Use Vision",
+                            interactive=True
+                        )
+                        max_actions_per_step = gr.Number(
+                            value=5,
+                            label="Max Actions Per Step",
+                            interactive=True
+                        )
+                        tool_calling_method = gr.Radio(
+                            choices=["function_calling", "json_mode"],
+                            value="function_calling",
+                            label="Tool Calling Method",
+                            interactive=True
+                        )
+
+                with gr.Row():
+                    save_config_btn = gr.Button("Save Config")
+                    load_config_btn = gr.Button("Load Config")
+                    reset_config_btn = gr.Button("Reset to Default")
+
             # Single Agent Tab
             with gr.Tab("Single Agent", id="single_agent"):
                 with gr.Row():
@@ -1314,189 +1506,6 @@ def create_ui():
                             interactive=False
                         )
 
-            # Settings Tab
-            with gr.Tab("Settings", id="settings"):
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("### LLM Settings")
-                        llm_provider = gr.Dropdown(
-                            choices=[provider for provider, model in utils.model_names.items()],
-                            value="openai",
-                            label="LLM Provider",
-                            info="Select your preferred language model provider",
-                            interactive=True
-                        )
-                        llm_model_name = gr.Dropdown(
-                            choices=utils.model_names[llm_provider.value],
-                            value=utils.model_names[llm_provider.value][0] if utils.model_names[llm_provider.value] else "",
-                            label="Model Name",
-                            info="Select a model from the dropdown or type a custom model name",
-                            interactive=True,
-                            allow_custom_value=True
-                        )
-                        llm_num_ctx = gr.Slider(
-                            minimum=1000,
-                            maximum=128000,
-                            value=4000,
-                            step=1000,
-                            label="Context Length",
-                            info="Maximum context length in tokens",
-                            interactive=True
-                        )
-                        llm_temperature = gr.Slider(
-                            minimum=0.0,
-                            maximum=2.0,
-                            value=0.0,
-                            step=0.1,
-                            label="Temperature",
-                            info="Controls randomness in the output (0.0 = deterministic, 2.0 = very random)",
-                            interactive=True
-                        )
-                        llm_base_url = gr.Textbox(
-                            value="",
-                            label="Base URL (optional)",
-                            info="Custom API endpoint URL (leave blank to use default)",
-                            interactive=True
-                        )
-                        llm_api_key = gr.Textbox(
-                            value="",
-                            label="API Key",
-                            type="password",
-                            info="Your API key (leave blank to use .env)",
-                            interactive=True
-                        )
-
-                    with gr.Column():
-                        gr.Markdown("### Browser Settings")
-                        use_own_browser = gr.Checkbox(
-                            value=False,
-                            label="Use Own Browser",
-                            interactive=True
-                        )
-                        keep_browser_open = gr.Checkbox(
-                            value=False,
-                            label="Keep Browser Open",
-                            interactive=True
-                        )
-                        headless = gr.Checkbox(
-                            value=False,
-                            label="Headless Mode",
-                            interactive=True
-                        )
-                        disable_security = gr.Checkbox(
-                            value=False,
-                            label="Disable Security",
-                            interactive=True
-                        )
-                        window_w = gr.Number(
-                            value=1280,
-                            label="Window Width",
-                            interactive=True
-                        )
-                        window_h = gr.Number(
-                            value=720,
-                            label="Window Height",
-                            interactive=True
-                        )
-
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("### Recording Settings")
-                        save_recording_path = gr.Textbox(
-                            value="recordings",
-                            label="Recording Path",
-                            interactive=True
-                        )
-                        save_agent_history_path = gr.Textbox(
-                            value="agent_history",
-                            label="Agent History Path",
-                            interactive=True
-                        )
-                        save_trace_path = gr.Textbox(
-                            value="traces",
-                            label="Trace Path",
-                            interactive=True
-                        )
-                        enable_recording = gr.Checkbox(
-                            value=True,
-                            label="Enable Recording",
-                            interactive=True
-                        )
-
-                    with gr.Column():
-                        gr.Markdown("### Agent Settings")
-                        max_steps = gr.Number(
-                            value=50,
-                            label="Max Steps",
-                            interactive=True
-                        )
-                        use_vision = gr.Checkbox(
-                            value=False,
-                            label="Use Vision",
-                            interactive=True
-                        )
-                        max_actions_per_step = gr.Number(
-                            value=5,
-                            label="Max Actions Per Step",
-                            interactive=True
-                        )
-                        tool_calling_method = gr.Radio(
-                            choices=["function_calling", "json_mode"],
-                            value="function_calling",
-                            label="Tool Calling Method",
-                            interactive=True
-                        )
-
-                with gr.Row():
-                    save_config_btn = gr.Button("Save Config")
-                    load_config_btn = gr.Button("Load Config")
-                    reset_config_btn = gr.Button("Reset to Default")
-
-            # Test Automator Tab
-            with gr.Tab("Test Automator", id="test_automator"):
-                with gr.Row():
-                    with gr.Column():
-                        task_input = gr.Textbox(
-                            label="Task Description",
-                            placeholder="Describe the test scenario",
-                            lines=3,
-                            interactive=True
-                        )
-                        generate_button = gr.Button("Generate Test", variant="primary")
-                        execute_button = gr.Button("Execute Test", interactive=False)
-
-                    with gr.Column():
-                        test_code = gr.Code(
-                            label="Generated Test Code",
-                            language="python",
-                            interactive=False
-                        )
-                        error_output = gr.Textbox(
-                            label="Error",
-                            visible=False,
-                            interactive=False
-                        )
-                        screenshot_output = gr.Image(
-                            label="Screenshot",
-                            visible=False,
-                            interactive=False
-                        )
-                        video_output = gr.Video(
-                            label="Recording",
-                            visible=False,
-                            interactive=False
-                        )
-                        video_file = gr.File(
-                            label="Download Recording",
-                            visible=False,
-                            interactive=False
-                        )
-                        logs_output = gr.Textbox(
-                            label="Logs",
-                            lines=10,
-                            interactive=False
-                        )
-
         # Event handlers
         llm_provider.change(
             fn=update_model_dropdown,
@@ -1519,7 +1528,7 @@ def create_ui():
 
         load_config_btn.click(
             fn=load_config_from_file,
-            inputs=[],
+            inputs=[llm_provider],
             outputs=[
                 llm_provider, llm_model_name, llm_num_ctx, llm_temperature,
                 llm_base_url, llm_api_key, use_own_browser, keep_browser_open,
@@ -1532,7 +1541,7 @@ def create_ui():
 
         reset_config_btn.click(
             fn=update_ui_from_config,
-            inputs=[],
+            inputs=[llm_provider],
             outputs=[
                 llm_provider, llm_model_name, llm_num_ctx, llm_temperature,
                 llm_base_url, llm_api_key, use_own_browser, keep_browser_open,
@@ -1690,16 +1699,16 @@ def create_ui():
         generate_button.click(
             fn=generate_test,
             inputs=[task_input, llm_provider, llm_model_name, llm_api_key, llm_base_url],
-            outputs=[test_code, error_output, execute_button, video_output, video_file, logs_output]
+            outputs=[test_code, error_output, execute_button, video_output, video_file, generation_logs]
         )
-
+        
         execute_button.click(
             fn=execute_test,
             inputs=[test_code, llm_provider, llm_model_name, llm_api_key, llm_base_url],
-            outputs=[error_output, screenshot_output, video_output, video_file, logs_output]
+            outputs=[error_output, screenshot_output, video_output, video_file, execution_logs]
         )
-
-        return demo
+        
+    return demo
 
 def main():
     parser = argparse.ArgumentParser(description="Gradio UI for Browser Agent")
